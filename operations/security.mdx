@@ -1,5 +1,5 @@
 ---
-title: "Security Practices in GSM Infrastructure"
+title: "GSM Infrastructure Security: IAM, OIDC, and Network Controls"
 sidebarTitle: "Security"
 description: "How GSM Infrastructure enforces least-privilege IAM, keyless OIDC auth, SSM secrets management, security group isolation, and S3 public access controls."
 ---
@@ -45,7 +45,7 @@ The `InfraExecutorRole` has three separate IAM policies attached. Every resource
     - **SNS** — create/delete/subscribe topics scoped to `{env}-*`
     - **Budgets** — create/update/delete budgets scoped to `{env}-*`
     - **SSM GetParameter** — read parameters under `/{env}/*` and `/aws/service/*` (for ECS-optimized AMI lookups)
-    - **SSM Session Manager** — `StartSession`, `TerminateSession`, `ResumeSession` on any resource (required for Console access)
+    - **SSM Session Manager** — `StartSession`, `TerminateSession`, `ResumeSession`, `DescribeSessions`, `GetConnectionStatus` on any resource (required for Console access)
     - **KMS** — encrypt/decrypt with any key in the account/region
     - **IAM** — full role/policy/instance-profile lifecycle scoped to `{env}-*` ARNs
     - **CloudFormation** — full stack lifecycle scoped to `{env}-*` stacks

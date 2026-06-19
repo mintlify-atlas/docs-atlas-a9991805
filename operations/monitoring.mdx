@@ -1,5 +1,5 @@
 ---
-title: "Monitoring GSM Infrastructure with CloudWatch and AWS Budgets"
+title: "Monitoring GSM Infrastructure: CloudWatch and Budgets"
 sidebarTitle: "Monitoring"
 description: "Monitor GSM Infrastructure health using CloudWatch log groups, ECS service health checks, EC2 instance status, and AWS Budget cost alerts."
 ---
@@ -23,7 +23,7 @@ Three log groups are created by the CloudFormation stacks. Retention policies ar
 
     Filter example in CloudWatch Logs Insights:
 
-    ```
+    ```sql
     fields @timestamp, @message
     | filter @logStream like /gmsauth/
     | sort @timestamp desc
@@ -115,7 +115,7 @@ See [Cost Management](/operations/cost-management) for detailed configuration gu
 The EC2 instance is enrolled in **AWS Systems Manager (SSM)** via the `AmazonSSMManagedInstanceCore` managed policy attached to its IAM instance role. This enables:
 
 - **Session Manager** — open an interactive shell session to the instance from the AWS Console or CLI without opening SSH port 22 or managing key pairs for day-to-day access.
-- **SSM Parameter Store access** — the instance role also includes a scoped `SSMParameterStoreRead` inline policy that allows `ssm:GetParameter*` and `kms:Decrypt` for the `/{env}/*` parameter path.
+- **SSM Parameter Store access** — the instance role also includes a scoped `SSMParameterStoreRead` inline policy that allows `ssm:GetParameter`, `ssm:GetParameters`, `ssm:GetParameterHistory`, `ssm:GetParametersByPath`, and `kms:Decrypt` for the `/{env}/*` parameter path.
 
 **Open a Session Manager session (CLI):**
 

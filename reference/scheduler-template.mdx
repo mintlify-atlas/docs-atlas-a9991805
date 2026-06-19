@@ -1,7 +1,7 @@
 ---
-title: "Scheduler Template Reference: Lambda Start/Stop and EventBridge"
+title: "Scheduler Template Reference: Lambda and EventBridge"
 sidebarTitle: "Scheduler Template"
-description: "Complete parameter, resource, and output reference for devops/scheduler/template.yml — the EventBridge Scheduler and Lambda start/stop CloudFormation stack."
+description: "Full parameter, resource, and output reference for devops/scheduler/template.yml — EventBridge Schedules with Lambda stop/start functions."
 ---
 
 The scheduler template (`devops/scheduler/template.yml`) automates cost savings by shutting down and restarting the GSM platform's EC2 ECS host on a weekday schedule aligned to Colombia Time (COT, UTC−5). Two Python Lambda functions handle the stop and start sequences: the stop function scales all four ECS services to zero, disassociates the Elastic IP (to avoid idle EIP charges), and stops the EC2 instance; the start function reverses the sequence — starts the instance, waits for it to reach the `running` state, reassociates the EIP, then scales ECS services back to one. An EventBridge Scheduler group drives both functions on configurable cron expressions.

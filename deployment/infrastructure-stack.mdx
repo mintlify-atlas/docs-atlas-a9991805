@@ -113,7 +113,7 @@ After a successful deploy, CloudFormation exports these values. Use them as inpu
 | `FrontendBucketName` | Name of the S3 bucket for frontend assets. Use this as the upload target in your frontend CI/CD pipeline. |
 | `CloudFrontDomain` | CloudFront distribution domain name (e.g. `d1abc2defg3.cloudfront.net`). |
 | `ECSClusterName` | Name of the ECS cluster — required by the scheduler stack's `ECSClusterName` parameter. |
-| `BudgetName` | Name of the AWS Budget resource created in this stack. |
+| `BudgetName` | Name of the AWS Budget resource. Note: the output value contains a double-dash: `{env}--{appName}-monthly-budget` (source typo). The budget resource itself is named `{env}-{appName}-monthly-budget`. |
 
 To read outputs from the CLI:
 

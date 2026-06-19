@@ -1,7 +1,7 @@
 ---
 title: "CI/CD Workflows: Branch-Driven CloudFormation Deployments"
 sidebarTitle: "CI/CD"
-description: "GitHub Actions workflows for GSM Infrastructure automatically deploy CloudFormation stacks on push to develop, quality, and main — with OIDC keyless AWS authentication."
+description: "GitHub Actions workflows deploy GSM Infrastructure CloudFormation stacks on push to develop, quality, and main using OIDC keyless AWS authentication."
 ---
 
 GSM Infrastructure uses two GitHub Actions workflows — `deploy-infrastructure.yml` and `deploy-scheduler.yml` — to deploy CloudFormation stacks automatically whenever the corresponding template files change on a tracked branch. Each branch maps to a fixed AWS environment (`dev`, `qa`, or `prod`), so merging a pull request from `develop` into `quality` or `quality` into `main` triggers the correct environment deploy without any manual configuration. Authentication to AWS is handled through OpenID Connect (OIDC), meaning no static AWS access keys are stored in GitHub Secrets.
@@ -104,14 +104,29 @@ The `AWS_INFRA_ROLE_ARN` secret must be set on each GitHub Actions environment (
 
 Both workflows expose a `workflow_dispatch` trigger, allowing you to deploy to any environment outside of a branch push — useful for first-time setup, rollbacks, or deploying infrastructure changes before the template file is merged to a tracked branch.
 
-The full trigger block used in both workflows:
+The trigger block structure is identical in both workflows — they differ only in the path filter. The infrastructure workflow monitors `devops/infrastructure/template.yml`; the scheduler workflow monitors `devops/scheduler/template.yml`:
 
 ```yaml
+# deploy-infrastructure.yml
 on:
   push:
     branches: ["develop", "quality", "main"]
     paths:
       - "devops/infrastructure/template.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (dev/qa/prod)'
+        default: 'dev'
+```
+
+```yaml
+# deploy-scheduler.yml
+on:
+  push:
+    branches: ["develop", "quality", "main"]
+    paths:
+      - "devops/scheduler/template.yml"
   workflow_dispatch:
     inputs:
       environment:

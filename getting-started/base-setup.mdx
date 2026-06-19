@@ -1,7 +1,7 @@
 ---
-title: "Deploy the Base Stack: OIDC Provider and IAM Role"
+title: "Deploy the GSM Base Stack: OIDC Provider and IAM Role"
 sidebarTitle: "Base Setup"
-description: "Deploy the GSM Infrastructure base CloudFormation stack to create the GitHub OIDC provider and least-privilege IAM executor role for keyless CI/CD authentication."
+description: "Deploy the GSM base CloudFormation stack to provision the GitHub OIDC provider and least-privilege IAM executor role for keyless deployments."
 ---
 
 The base stack (`devops/base/template.yml`) is the foundation of the entire GSM Infrastructure deployment pipeline. It must be deployed **manually, once**, before the GitHub Actions workflows can authenticate with AWS. Without it, the workflows have no IAM role to assume and every push to a tracked branch will fail at the credential configuration step.

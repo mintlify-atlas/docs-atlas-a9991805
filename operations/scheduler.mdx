@@ -1,7 +1,7 @@
 ---
-title: "Operate the GSM Start/Stop Scheduler"
+title: "GSM Infrastructure Start/Stop Scheduler Operations"
 sidebarTitle: "Scheduler"
-description: "Manage, monitor, and adjust the EventBridge Scheduler that automatically starts and stops the GSM Infrastructure EC2 instance and ECS services on a weekday schedule."
+description: "Configure and monitor the EventBridge Scheduler that starts and stops the GSM Infrastructure EC2 instance and ECS services on a weekday cron."
 ---
 
 The GSM Infrastructure scheduler reduces costs by automatically shutting down the EC2 instance and all ECS services outside of business hours and bringing them back up in the morning. It is implemented as two AWS Lambda functions (Python 3.12, arm64) triggered by Amazon EventBridge Scheduler on a Mon–Sat cron schedule. The schedules are fully configurable via CloudFormation parameters and are deployed independently from the main infrastructure stack through the `deploy-scheduler.yml` GitHub Actions workflow.

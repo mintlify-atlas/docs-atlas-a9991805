@@ -89,7 +89,7 @@ The public-facing entry point. CloudFront routes all `/api/*` traffic to port 80
 | Container name   | `gsmgateway`                                   |
 | Image tag        | `gateway-latest`                               |
 | Host / container port | `80`                                      |
-| Health check     | `GET http://localhost:80/api/health`           |
+| Health check     | `wget -qO- http://localhost:80/api/health`     |
 | Health interval  | 30 s, timeout 10 s, retries 3                  |
 | Secrets injected | `JWT_SECRET` (from SSM)                        |
 | Env vars         | `ORIGINS` (CloudFront domain), `ENVIRONMENT`   |
@@ -108,7 +108,7 @@ Handles authentication and JWT issuance. Receives traffic internally from the ga
 | Container name   | `gmsauth`                                      |
 | Image tag        | `auth-latest`                                  |
 | Host / container port | `8081`                                    |
-| Health check     | `GET http://localhost:8081/health`             |
+| Health check     | `wget -qO- http://localhost:8081/health`       |
 | Health interval  | 30 s, timeout 10 s, retries 3                  |
 | Secrets injected | `JWT_SECRET`, `DB_MASTER_URL` (from SSM)       |
 | Env vars         | `ENVIRONMENT`                                  |
@@ -125,7 +125,7 @@ Core application business logic service.
 | Container name   | `gsmapplication`                               |
 | Image tag        | `application-latest`                           |
 | Host / container port | `8082`                                    |
-| Health check     | `GET http://localhost:8082/health`             |
+| Health check     | `wget -qO- http://localhost:8082/health`       |
 | Health interval  | 30 s, timeout 10 s, retries 3                  |
 | Secrets injected | `JWT_SECRET`, `DB_MASTER_URL` (from SSM)       |
 | Env vars         | `ENVIRONMENT`                                  |
@@ -142,7 +142,7 @@ Operations and administrative service.
 | Container name   | `gsmoperations`                                |
 | Image tag        | `gsmoperations-latest`                         |
 | Host / container port | `8083`                                    |
-| Health check     | `GET http://localhost:8083/health`             |
+| Health check     | `wget -qO- http://localhost:8083/health`       |
 | Health interval  | 30 s, timeout 10 s, retries 3                  |
 | Secrets injected | `JWT_SECRET`, `DB_MASTER_URL` (from SSM)       |
 | Env vars         | `ENVIRONMENT`                                  |
@@ -190,7 +190,7 @@ Browser
   │                        │
   │                        └─▶ EC2 origin (HTTP port 80) ──▶ gsmgateway container
   │
-  └─ GET /*      ──▶ CloudFront default behavior (GET/HEAD only, redirect-to-https)
+  └─ GET /*      ──▶ CloudFront default behavior (GET/HEAD/OPTIONS, redirect-to-https)
                            │
                            └─▶ S3 origin (OAC, /admin path)
 ```

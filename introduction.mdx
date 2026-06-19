@@ -1,7 +1,7 @@
 ---
 title: "GSM Infrastructure: AWS IaC for Multi-Service Applications"
 sidebarTitle: "Introduction"
-description: "GSM Infrastructure is a CloudFormation-based platform that deploys ECS-on-EC2 microservices, CloudFront+S3 frontend, cost scheduling, and keyless CI/CD across three environments."
+description: "CloudFormation IaC platform for ECS-on-EC2 microservices, a CloudFront+S3 frontend, EventBridge cost scheduling, and keyless GitHub OIDC deployments."
 ---
 
 GSM Infrastructure is an AWS CloudFormation infrastructure-as-code platform purpose-built to deploy and operate a multi-service GSM application in the cloud. It eliminates the manual effort of configuring AWS resources by expressing your entire stack — from S3-backed static frontend and ECS microservices, to IAM roles and EventBridge cost-scheduling — as a versioned set of CloudFormation templates. Changes to those templates flow automatically through GitHub Actions workflows that assume short-lived AWS credentials via GitHub OIDC, meaning no static access keys are ever stored or rotated by hand.

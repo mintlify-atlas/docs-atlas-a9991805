@@ -1,7 +1,7 @@
 ---
 title: "Deploy the GSM Cost Scheduler CloudFormation Stack"
 sidebarTitle: "Scheduler Stack"
-description: "Deploy devops/scheduler/template.yml to provision EventBridge Scheduler rules and Lambda functions that automatically start and stop the EC2 instance on a weekday schedule."
+description: "Deploy devops/scheduler/template.yml to provision EventBridge Scheduler rules and Lambda functions that start and stop the EC2 instance on weekdays."
 ---
 
 The GSM scheduler stack reduces compute costs by running infrastructure only during business hours. It provisions two Python Lambda functions and a pair of EventBridge Scheduler rules that automatically stop the EC2 instance (and scale down ECS) each night, then restart everything each morning — Monday through Saturday. Because the EC2 instance is the sole compute host, turning it off outside working hours eliminates instance charges for roughly half of each calendar month without any manual intervention.
@@ -110,7 +110,7 @@ aws cloudformation deploy \
   --region us-east-1 \
   --parameter-overrides \
     Environment=dev \
-    AppName=gsmapplication \
+    AppName=GSMApplication \
     EC2InstanceId=i-0abc123def456789 \
     EIPAllocationId=eipalloc-0abc1234def56789 \
     ECSClusterName=dev-gsmapplication-cluster \

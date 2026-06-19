@@ -1,5 +1,5 @@
 ---
-title: "ECS Services Reference: Gateway, Auth, Application, Operations"
+title: "ECS Services Reference: Ports, Secrets, Health Checks"
 sidebarTitle: "ECS Services"
 description: "Configuration reference for the four ECS-on-EC2 microservices in GSM Infrastructure: ports, health checks, secrets, memory limits, and deployment settings."
 ---
@@ -68,7 +68,7 @@ The gateway service is the **public-facing entry point** for all API traffic. Cl
     | `JWT_SECRET` | `JWTSecretParameterName` | JWT signing/verification key |
   </Tab>
   <Tab title="Health Check">
-    ```
+    ```bash
     CMD-SHELL: wget -qO- http://localhost:80/api/health || exit 1
     ```
     | Setting | Value |
@@ -113,7 +113,7 @@ The auth service handles authentication and token issuance. It is reachable from
     | `DB_MASTER_URL` | `DBMasterUrlParameterName` | Database connection string |
   </Tab>
   <Tab title="Health Check">
-    ```
+    ```bash
     CMD-SHELL: wget -qO- http://localhost:8081/health || exit 1
     ```
     | Setting | Value |
@@ -158,7 +158,7 @@ The application service implements core business logic. It listens on port 8082 
     | `DB_MASTER_URL` | `DBMasterUrlParameterName` | Database connection string |
   </Tab>
   <Tab title="Health Check">
-    ```
+    ```bash
     CMD-SHELL: wget -qO- http://localhost:8082/health || exit 1
     ```
     | Setting | Value |
@@ -203,7 +203,7 @@ The operations service handles administrative and operational workflows. It list
     | `DB_MASTER_URL` | `DBMasterUrlParameterName` | Database connection string |
   </Tab>
   <Tab title="Health Check">
-    ```
+    ```bash
     CMD-SHELL: wget -qO- http://localhost:8083/health || exit 1
     ```
     | Setting | Value |

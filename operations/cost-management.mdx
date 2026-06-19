@@ -10,7 +10,7 @@ GSM Infrastructure ships with a layered cost-control strategy that combines an A
 
 The `AwsCostBudget` CloudFormation resource provisions a monthly **COST** budget automatically named:
 
-```
+```text
 {env}-{appName}-monthly-budget
 ```
 
@@ -47,7 +47,7 @@ AWS Budgets evaluates spend up to three times per day. The alert may not fire th
 
 The infrastructure stack creates an SNS topic named:
 
-```
+```text
 {env}-{appName}-notification-alerts
 ```
 
