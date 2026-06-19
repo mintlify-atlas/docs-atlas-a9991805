@@ -1,0 +1,216 @@
+---
+title: "Security Practices in GSM Infrastructure"
+sidebarTitle: "Security"
+description: "How GSM Infrastructure enforces least-privilege IAM, keyless OIDC auth, SSM secrets management, security group isolation, and S3 public access controls."
+---
+
+GSM Infrastructure applies defense-in-depth across every layer of the stack: GitHub Actions authenticates to AWS using short-lived OIDC tokens (no static credentials), IAM policies are split into three scope-limited layers, sensitive runtime secrets never leave SSM Parameter Store, network ingress is constrained to specific CIDR blocks and AWS-managed prefix lists, S3 is hardened with encryption and HTTPS enforcement, and container images are automatically scanned for vulnerabilities on upload. This page documents each control so you can audit, extend, or adapt them to your organization's requirements.
+
+## Keyless CI/CD Authentication
+
+The base stack provisions a GitHub OIDC provider (`token.actions.githubusercontent.com`) and an `InfraExecutorRole` that GitHub Actions assumes via `sts:AssumeRoleWithWebIdentity`. No long-lived AWS access keys are stored in GitHub Secrets — only the role ARN (`AWS_INFRA_ROLE_ARN`) is needed.
+
+The trust policy uses `StringLike` conditions to restrict role assumption to a specific organization, repository, and deployment context:
+
+```yaml
+Condition:
+  StringEquals:
+    'token.actions.githubusercontent.com:aud': sts.amazonaws.com
+  StringLike:
+    'token.actions.githubusercontent.com:sub':
+      - 'repo:{GitHubOrg}/{GitHubRepo}:ref:refs/heads/{GitHubBranch}'
+      - 'repo:{GitHubOrg}/{GitHubRepo}:environment:infra-*'
+      - 'repo:{GitHubOrg}/{GitHubRepo}:environment:backend-*'
+      - 'repo:{GitHubOrg}/{GitHubRepo}:environment:frontend-*'
+```
+
+| Subject pattern | Grants access to |
+|---|---|
+| `repo:{org}/{repo}:ref:refs/heads/{branch}` | Pushes to the configured branch (e.g., `main`) |
+| `repo:{org}/{repo}:environment:infra-*` | Jobs in environments named `infra-dev`, `infra-qa`, `infra-prod` |
+| `repo:{org}/{repo}:environment:backend-*` | Jobs in `backend-dev`, `backend-qa`, `backend-prod` |
+| `repo:{org}/{repo}:environment:frontend-*` | Jobs in `frontend-dev`, `frontend-qa`, `frontend-prod` |
+
+<Note>
+`CreateOIDCProvider` should be set to `false` if you have already deployed the base stack once (or if another stack in the same AWS account has already created the GitHub OIDC provider). Only one OIDC provider per issuer URL is allowed per AWS account.
+</Note>
+
+## IAM Least-Privilege Policies
+
+The `InfraExecutorRole` has three separate IAM policies attached. Every resource ARN is prefixed with `{env}-` so a policy deployed for `dev` cannot operate on `prod` resources.
+
+<CardGroup cols={1}>
+  <Card title="ParametersResourcesPolicy" icon="sliders">
+    Covers infrastructure lifecycle operations:
+    - **SNS** — create/delete/subscribe topics scoped to `{env}-*`
+    - **Budgets** — create/update/delete budgets scoped to `{env}-*`
+    - **SSM GetParameter** — read parameters under `/{env}/*` and `/aws/service/*` (for ECS-optimized AMI lookups)
+    - **SSM Session Manager** — `StartSession`, `TerminateSession`, `ResumeSession` on any resource (required for Console access)
+    - **KMS** — encrypt/decrypt with any key in the account/region
+    - **IAM** — full role/policy/instance-profile lifecycle scoped to `{env}-*` ARNs
+    - **CloudFormation** — full stack lifecycle scoped to `{env}-*` stacks
+    - **EventBridge** — put/delete rules and targets on any rule ARN
+  </Card>
+  <Card title="RuntimeResourcesPolicy" icon="play">
+    Covers compute and observability resources:
+    - **ECS** — cluster, service, and task definition management scoped to `{env}-*` clusters/services/task-definitions; `DeregisterTaskDefinition` and `DescribeTaskDefinition` are allowed on `*` (required by AWS)
+    - **CloudWatch Logs** — create/delete log groups and set retention policies scoped to `/*/{env}-*`
+    - **ELB** — NLB lifecycle scoped to `{env}-*` load balancers
+    - **Lambda** — function lifecycle scoped to `{env}-*` functions
+    - **GuardDuty** — detector create/update/delete/describe on any detector ARN in the account
+  </Card>
+  <Card title="StaticResourcesPolicy" icon="box-archive">
+    Covers storage, CDN, compute, and registry resources:
+    - **S3** — full bucket/object lifecycle scoped to `{env}-*-frontend` bucket ARNs only
+    - **CloudFront** — distribution and OAC lifecycle; CloudFront Function lifecycle
+    - **EC2** — security group, instance, EIP, and ENI management (describe actions require `*` per AWS)
+    - **ECR** — repository lifecycle, image push/pull, scanning config scoped to `{env}-*` repositories; `GetAuthorizationToken` requires `*`
+    - **EventBridge Scheduler** — schedule and schedule group lifecycle (`*` required by AWS)
+    - **Service Discovery** — Cloud Map namespace and service lifecycle (`*` required by AWS)
+    - **Route 53** — hosted zone and record set management (`*` required by AWS)
+  </Card>
+</CardGroup>
+
+## Secrets Management
+
+Runtime secrets are stored in **AWS SSM Parameter Store** and injected into containers at task start — they are never embedded in container images, CloudFormation templates, or GitHub variables.
+
+The two secrets used by the backend services are:
+
+| Secret | Default SSM path | Used by |
+|---|---|---|
+| `JWT_SECRET` | `dev/backend/JWT_SECRET` | All four services |
+| `DB_MASTER_URL` | `dev/backend/DB_MASTER_URL` | `auth`, `application`, `operations` |
+
+Container task definitions reference these via the `Secrets` field using full parameter ARNs:
+
+```yaml
+Secrets:
+  - Name: JWT_SECRET
+    ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${JWTSecretParameterName}'
+  - Name: DB_MASTER_URL
+    ValueFrom: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBMasterUrlParameterName}'
+```
+
+The ECS execution role and task role both have a scoped SSM policy:
+
+```yaml
+- Effect: Allow
+  Action:
+    - ssm:GetParameter
+    - ssm:GetParameters
+  Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Environment}/*'
+- Effect: Allow
+  Action:
+    - kms:Decrypt
+  Resource: !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:*'
+```
+
+<Warning>
+Do **not** store DB connection strings or JWT secrets as GitHub Actions secrets or CloudFormation parameters. Anyone with read access to the repository settings or the CloudFormation stack outputs could read them. Always create them as `SecureString` parameters in SSM Parameter Store directly, then reference the parameter name (not the value) in GitHub variables.
+</Warning>
+
+## S3 and CloudFront Security
+
+The frontend S3 bucket (`{env}-{appName}-frontend`) is hardened with three controls:
+
+**1. All public access blocked:**
+```yaml
+PublicAccessBlockConfiguration:
+  BlockPublicAcls: true
+  BlockPublicPolicy: true
+  IgnorePublicAcls: true
+  RestrictPublicBuckets: true
+```
+
+**2. Server-side encryption at rest:**
+```yaml
+BucketEncryption:
+  ServerSideEncryptionConfiguration:
+    - ServerSideEncryptionByDefault:
+        SSEAlgorithm: AES256
+```
+
+**3. HTTPS-only bucket policy (deny non-TLS requests):**
+```yaml
+- Effect: Deny
+  Principal: '*'
+  Action: 's3:*'
+  Resource:
+    - !Sub '${FrontendBucket.Arn}'
+    - !Sub '${FrontendBucket.Arn}/*'
+  Condition:
+    Bool:
+      aws:SecureTransport: false
+```
+
+Content is served exclusively through a **CloudFront Origin Access Control (OAC)** using SigV4 signing. The bucket policy allows `s3:GetObject` only when the request `AWS:SourceArn` matches the specific CloudFront distribution ARN — any direct S3 access attempt is denied.
+
+Versioning is enabled on the bucket, providing an audit trail of deployed frontend builds.
+
+## Network Isolation
+
+The EC2 instance runs in a **private subnet** with no inbound internet-facing rules. All legitimate inbound traffic arrives through CloudFront.
+
+**ECS Security Group — inbound rules:**
+
+| Protocol | Port | Source | Purpose |
+|---|---|---|---|
+| TCP | 80 | `pl-3b927c52` (CloudFront prefix list) | HTTPS traffic forwarded by CloudFront |
+| TCP | 80 | VPC CIDR (`VpcIdCidrBlock`) | Internal VPC traffic |
+| TCP | 8081–8083 | `172.17.0.0/16` (Docker bridge) | Inter-container communication |
+
+**ECS Security Group — outbound rules:**
+
+| Protocol | Port | Destination | Purpose |
+|---|---|---|---|
+| TCP | 443 | `0.0.0.0/0` | HTTPS outbound (SSM, ECR, AWS APIs) |
+| UDP | 53 | `0.0.0.0/0` | DNS resolution |
+| TCP | 8081–8083 | `172.17.0.0/16` | Inter-container communication |
+| TCP | `DBPortParameterName` (default 1433) | `SqlServerProviderIp` | Database connectivity |
+
+<Tip>
+Scope `SqlServerProviderIp` to the exact CIDR of your database provider (e.g., `10.0.1.5/32`) rather than leaving it as `0.0.0.0/0`. Keeping the egress rule broad opens the instance to outbound SQL Server connections to any internet host, which violates least-privilege egress principles. Update the GitHub variable `DB_MASTER_IP` to the specific IP of your database server.
+</Tip>
+
+## ECR Security
+
+Every ECR repository created by the infrastructure stack has **image scanning on push** enabled:
+
+```yaml
+ECRRepository:
+  Type: AWS::ECR::Repository
+  Properties:
+    RepositoryName: !Sub '${Environment}-${AppName}-respository'
+    ImageScanningConfiguration:
+      ScanOnPush: true
+```
+
+When you push an image tag to ECR, AWS automatically runs a **Basic Scan** (powered by Clair) against the image layers. Scan findings are available in the ECR Console under **Images → Vulnerabilities** and can be retrieved via the CLI:
+
+```bash
+aws ecr describe-image-scan-findings \
+  --repository-name dev-gsmapplication-respository \
+  --image-id imageTag=gateway-latest
+```
+
+Consider enabling **ECR Enhanced Scanning** (Amazon Inspector) in production environments for continuous, real-time vulnerability assessment rather than per-push scanning only.
+
+## GuardDuty
+
+The `RuntimeResourcesPolicy` grants the `InfraExecutorRole` permissions to manage GuardDuty detectors:
+
+```yaml
+- Effect: Allow
+  Action:
+    - guardduty:CreateDetector
+    - guardduty:DeleteDetector
+    - guardduty:GetDetector
+    - guardduty:UpdateDetector
+    - guardduty:ListDetectors
+    - guardduty:TagResource
+    - guardduty:UntagResource
+  Resource: !Sub 'arn:${AWS::Partition}:guardduty:${AWS::Region}:${AWS::AccountId}:detector/*'
+```
+
+This allows infrastructure automation to enable GuardDuty threat detection for the account/region as part of the stack deployment. GuardDuty analyzes VPC Flow Logs, DNS query logs, and CloudTrail events to surface findings such as compromised credentials, unusual API calls, and potential data exfiltration attempts.

@@ -1,72 +1,89 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "GSM Infrastructure",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
-  },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "primary": "#FF9900",
+    "light": "#FFB84D",
+    "dark": "#CC7A00"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/ti-infinite/GSMInfrastructure"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/ti-infinite/GSMInfrastructure"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Getting Started",
+            "pages": [
+              "getting-started/prerequisites",
+              "getting-started/base-setup",
+              "getting-started/configuration"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/infrastructure-stack",
+              "deployment/scheduler-stack",
+              "deployment/ci-cd"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/cost-management",
+              "operations/scheduler",
+              "operations/monitoring",
+              "operations/security"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "CloudFormation Stacks",
+            "pages": [
+              "reference/base-template",
+              "reference/infrastructure-template",
+              "reference/scheduler-template"
+            ]
+          },
+          {
+            "group": "GitHub Actions Workflows",
+            "pages": [
+              "reference/workflow-infrastructure",
+              "reference/workflow-scheduler"
+            ]
+          },
+          {
+            "group": "AWS Services",
+            "pages": [
+              "reference/ecs-services",
+              "reference/networking"
+            ]
+          }
+        ]
+      }
+    ]
   }
 }

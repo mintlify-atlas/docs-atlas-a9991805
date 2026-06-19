@@ -1,0 +1,195 @@
+---
+title: "Deploy the GSM Infrastructure CloudFormation Stack"
+sidebarTitle: "Infrastructure Stack"
+description: "Deploy devops/infrastructure/template.yml to provision S3, CloudFront, ECS cluster, EC2, ECR, security groups, IAM roles, AWS Budget, and SNS alerts."
+---
+
+The GSM infrastructure stack is the foundational CloudFormation template that provisions every AWS resource the application depends on — from the S3-backed CloudFront frontend to the EC2-hosted ECS cluster running the four backend microservices. Deploy this stack first, into any environment (`dev`, `qa`, or `prod`), before deploying the scheduler stack or pushing container images. Re-deployments are safe; the workflow uses `no-fail-on-empty-changeset` so running it again with no template changes succeeds without error.
+
+## What gets created
+
+The template at `devops/infrastructure/template.yml` provisions the following resources, all named using the `{Environment}-{AppName}-*` convention:
+
+**Frontend**
+- **S3 bucket** — `{env}-{appName}-frontend`: versioning enabled, AES-256 server-side encryption, all public access blocked.
+- **CloudFront Origin Access Control (OAC)** — restricts S3 access to CloudFront only, signed with SigV4.
+- **CloudFront Function** — `SpaRouterFunction` rewrites extension-less URI paths to `/index.html` for SPA routing.
+- **CloudFront distribution** — HTTPS redirect enforced on the default cache behavior; a dedicated `/api/*` cache behavior forwards requests to the EC2 backend with all headers and cookies passed through (`MinTTL: 0`, `DefaultTTL: 0`, `MaxTTL: 0`). Uses `PriceClass_100` (US/EU/Canada edge locations).
+
+**Backend compute**
+- **ECR repository** — `{env}-{appName}-respository` with `ScanOnPush: true`.
+- **ECS cluster** — `{env}-{appName}-cluster`.
+- **Four ECS task definitions and services** (EC2 launch type, `bridge` network mode):
+  - `gateway` — port 80, image tag `gateway-latest`
+  - `auth` — port 8081, image tag `auth-latest`
+  - `application` — port 8082, image tag `application-latest`
+  - `operations` — port 8083, image tag `gsmoperations-latest`
+- **EC2 instance** — `{env}-{appName}-ec2-instance`: arm64 architecture, default type `t4g.medium`, ECS-optimized Amazon Linux 2023 AMI (resolved via SSM at deploy time). User data registers the instance to the ECS cluster automatically.
+- **Elastic IP** — allocated and associated to the EC2 instance. Leave `ExistingEIPPublicIp` empty to allocate a new EIP, or pass an existing public IP to reuse it.
+
+**Networking & security**
+- **Security group** — `{env}-{appName}-ecs-security-group`: ingress on port 80 from the CloudFront managed prefix list and VPC CIDR; inter-container communication on ports 8081–8083 over the Docker bridge (`172.17.0.0/16`); egress for HTTPS (443), DNS (UDP 53), and the database port.
+
+**IAM**
+- **ECS execution role** — `{env}-{appName}-ecs-role`: `AmazonECSTaskExecutionRolePolicy` + SSM `GetParameter` access under `{env}/*`.
+- **ECS task role** — `{env}-{appName}-ecs-task-role`: SSM read access under `{env}/*`.
+- **EC2 instance role** — `{env}-{appName}-instance-ecs-role`: `AmazonEC2ContainerServiceforEC2Role`, `AmazonSSMManagedInstanceCore`, and SSM read access.
+
+**Observability & cost controls**
+- **CloudWatch log group** — `/ecs/{env}-{appName}-backend` with 7-day retention.
+- **SNS topic** — `{env}-{appName}-notification-alerts`: email subscription using `AlertEmail`.
+- **AWS Budget** — `{env}-{appName}-monthly-budget`: monthly cost budget in USD; SNS alert fires at 100% of the configured limit.
+
+---
+
+## CloudFormation parameters
+
+<Accordion title="All parameters with defaults">
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `Environment` | `dev` | Deployment target — `dev`, `qa`, or `prod`. Controls resource naming and SSM path prefixes. |
+| `AppName` | `gsmapplication` | Base name for all provisioned resources. |
+| `BudgetLimitUSD` | `30` | Monthly AWS cost limit in USD before an SNS alert is triggered. |
+| `AlertEmail` | *(required)* | Email address that receives budget breach notifications from the SNS topic. |
+| `CloudFrontHeader` | *(required)* | Secret header value injected by CloudFront into origin requests (`X-CloudFront-Origin`); validated by the backend. |
+| `TaskNumberDesired` | `0` | Number of running tasks for each ECS service. Keep at `0` until container images have been pushed to ECR. |
+| `TaskMemory` | `512` | Hard memory limit (MB) applied to each ECS container. |
+| `TaskMemoryReservation` | `384` | Soft memory reservation (MB) per ECS container. |
+| `DBPortParameterName` | `1433` | TCP port of the SQL Server database used in the security group egress rule. |
+| `DBMasterUrlParameterName` | `dev/backend/DB_MASTER_URL` | SSM Parameter Store path for the master database connection string. |
+| `SqlServerProviderIp` | `0.0.0.0/0` | CIDR block of the SQL Server provider, used in the security group egress rule. Narrow this to a `/32` in production. |
+| `JWTSecretParameterName` | `dev/backend/JWT_SECRET` | SSM Parameter Store path for the JWT signing secret. |
+| `VpcId` | *(required)* | ID of the existing VPC where the EC2 instance and security group are placed. |
+| `VpcIdCidrBlock` | `10.0.0.0/16` | CIDR block of the VPC; used in security group ingress rules. |
+| `PrivateSubnet1Id` | *(required)* | Subnet ID (private, AZ1) in which the EC2 instance is launched. |
+| `Ec2PenKeyName` | `dev-key-ec2` | Name of the EC2 key pair for SSH access. |
+| `Ec2InstanceType` | `t4g.medium` | EC2 instance type. Must be arm64-compatible to match the Amazon Linux 2023 arm64 AMI. |
+| `ExistingEIPPublicIp` | `""` | Public IP of an existing Elastic IP to reuse. Leave empty to have CloudFormation allocate a new EIP. |
+
+</Accordion>
+
+---
+
+## Deploy manually with AWS CLI
+
+Use the following command to deploy the stack directly from your terminal. Replace placeholder values with those matching your environment:
+
+```bash
+aws cloudformation deploy \
+  --template-file devops/infrastructure/template.yml \
+  --stack-name dev-gsmapplication-infrastructure-stack \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+    Environment=dev \
+    AppName=gsmapplication \
+    BudgetLimitUSD=30 \
+    AlertEmail=alerts@example.com \
+    CloudFrontHeader=my-secret-header-value \
+    TaskNumberDesired=0 \
+    TaskMemory=512 \
+    TaskMemoryReservation=384 \
+    DBPortParameterName=1433 \
+    DBMasterUrlParameterName=dev/backend/DB_MASTER_URL \
+    SqlServerProviderIp=10.1.2.3/32 \
+    JWTSecretParameterName=dev/backend/JWT_SECRET \
+    VpcId=vpc-0abc12345def67890 \
+    VpcIdCidrBlock=10.0.0.0/16 \
+    PrivateSubnet1Id=subnet-0abc12345def67890 \
+    Ec2PenKeyName=dev-key-ec2 \
+    Ec2InstanceType=t4g.medium \
+    ExistingEIPPublicIp=""
+```
+
+---
+
+## Stack outputs
+
+After a successful deploy, CloudFormation exports these values. Use them as inputs when deploying the scheduler stack:
+
+| Output key | Description |
+|------------|-------------|
+| `FrontendBucketName` | Name of the S3 bucket for frontend assets. Use this as the upload target in your frontend CI/CD pipeline. |
+| `CloudFrontDomain` | CloudFront distribution domain name (e.g. `d1abc2defg3.cloudfront.net`). |
+| `ECSClusterName` | Name of the ECS cluster — required by the scheduler stack's `ECSClusterName` parameter. |
+| `BudgetName` | Name of the AWS Budget resource created in this stack. |
+
+To read outputs from the CLI:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name dev-gsmapplication-infrastructure-stack \
+  --query "Stacks[0].Outputs" \
+  --output table
+```
+
+---
+
+## Deploying via GitHub Actions
+
+Pushing any change to `devops/infrastructure/template.yml` on the `develop`, `quality`, or `main` branches automatically triggers the `Deploy Infrastructure` workflow — provided the `WORKFLOW_INFRASTRUCTURE_ENABLED` GitHub Actions variable is set to `true` for that environment. Branch names map to environments as follows:
+
+| Branch | Environment |
+|--------|-------------|
+| `develop` | `dev` |
+| `quality` | `qa` |
+| `main` | `prod` |
+
+The workflow can also be triggered on-demand via **workflow_dispatch** with an explicit `environment` input. See the [CI/CD guide](/deployment/ci-cd) for full details on secrets, variables, and OIDC authentication.
+
+<Note>
+  The CloudFormation deploy step uses `no-fail-on-empty-changeset: "1"`, so re-running the workflow when the template has not changed will succeed without error. This is safe to do at any time.
+</Note>
+
+---
+
+## Post-deploy steps
+
+Once the stack is created, the ECS services are running with `DesiredCount: 0`. Before increasing the task count, push container images to the ECR repository.
+
+<Steps>
+  <Step title="Authenticate Docker to ECR">
+    ```bash
+    aws ecr get-login-password --region us-east-1 \
+      | docker login --username AWS \
+        --password-stdin <account-id>.dkr.ecr.us-east-1.amazonaws.com
+    ```
+  </Step>
+  <Step title="Tag and push all four images">
+    The ECR repository URI follows the pattern `<account-id>.dkr.ecr.us-east-1.amazonaws.com/{env}-{appName}-respository`.
+    Each service expects a specific image tag:
+
+    ```bash
+    REPO=<account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository
+
+    docker tag gateway:local      $REPO:gateway-latest
+    docker tag auth:local         $REPO:auth-latest
+    docker tag application:local  $REPO:application-latest
+    docker tag operations:local   $REPO:gsmoperations-latest
+
+    docker push $REPO:gateway-latest
+    docker push $REPO:auth-latest
+    docker push $REPO:application-latest
+    docker push $REPO:gsmoperations-latest
+    ```
+  </Step>
+  <Step title="Scale up ECS services">
+    Update the stack (or the `TASK_NUMBER_DESIRED` GitHub Actions variable) to set `TaskNumberDesired` to `1` or more, then re-run the workflow. Alternatively, update each service directly:
+
+    ```bash
+    CLUSTER=dev-gsmapplication-cluster
+
+    for SVC in gateway auth application operations; do
+      aws ecs update-service \
+        --cluster $CLUSTER \
+        --service dev-gsmapplication-${SVC}-service \
+        --desired-count 1
+    done
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+  `TaskNumberDesired` defaults to `0`. ECS services will not schedule any containers until images with the correct tags have been pushed to ECR **and** the desired count is increased. Attempting to scale up before pushing images will cause tasks to fail with an image-pull error and trigger the deployment circuit breaker rollback.
+</Warning>

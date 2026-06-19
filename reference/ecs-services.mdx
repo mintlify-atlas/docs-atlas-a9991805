@@ -1,0 +1,265 @@
+---
+title: "ECS Services Reference: Gateway, Auth, Application, Operations"
+sidebarTitle: "ECS Services"
+description: "Configuration reference for the four ECS-on-EC2 microservices in GSM Infrastructure: ports, health checks, secrets, memory limits, and deployment settings."
+---
+
+GSM Infrastructure runs four microservices as ECS tasks on a single EC2 instance using the **bridge** network mode. All services are defined as ECS Task Definitions inside `devops/infrastructure/template.yml` and registered to a shared ECS cluster (`{env}-{appName}-cluster`). Container images are pulled from a private ECR repository (`{env}-{appName}-respository`) that is also created by the same CloudFormation stack. Each service has its own task family, port mapping, health check, and set of SSM-sourced secrets — but all share the same memory parameters (`TaskMemory` / `TaskMemoryReservation`), 256 CPU units, and a consistent deployment configuration with circuit-breaker rollback enabled.
+
+<Warning>
+  `TaskNumberDesired` defaults to `0` — all four services start with zero running tasks. After the initial stack deployment you must update this parameter (or manually set the desired count in the ECS console) to actually run the services.
+</Warning>
+
+## Shared Configuration
+
+The following settings apply to **every** service unless noted otherwise in the per-service sections below.
+
+| Setting | Value |
+|---|---|
+| Launch type | EC2 |
+| Network mode | bridge |
+| CPU units | 256 |
+| Memory (hard limit) | `TaskMemory` parameter (default: `512` MB) |
+| Memory reservation (soft) | `TaskMemoryReservation` parameter (default: `384` MB) |
+| Health check interval | 30 s |
+| Health check timeout | 10 s |
+| Health check retries | 3 |
+| Health check start period | 120 s |
+| `HealthCheckGracePeriodSeconds` | 60 |
+| `MaximumPercent` | 100 |
+| `MinimumHealthyPercent` | 0 |
+| Deployment circuit breaker | Enabled, with rollback |
+| Log driver | `awslogs` → `/ecs/{env}-{appName}-backend` (7-day retention) |
+
+<Note>
+  `HealthCheckGracePeriodSeconds: 60` gives containers time to complete their startup sequence before ECS begins evaluating health check results. Without this buffer, ECS may replace healthy containers that are simply slow to start.
+</Note>
+
+---
+
+## Gateway Service
+
+The gateway service is the **public-facing entry point** for all API traffic. CloudFront routes `/api/*` requests to the EC2 instance on port 80, which is bound directly to this container.
+
+<Tabs>
+  <Tab title="Identity">
+    | Property | Value |
+    |---|---|
+    | Container name | `gsmgateway` |
+    | Task family | `{env}-{appName}-gateway-task` |
+    | ECS service name | `{env}-{appName}-gateway-service` |
+    | ECR image tag | `gateway-latest` |
+    | Image URI | `{ecr-repo}:gateway-latest` |
+  </Tab>
+  <Tab title="Port Mapping">
+    | Container port | Host port | Protocol |
+    |---|---|---|
+    | 80 | 80 | tcp |
+  </Tab>
+  <Tab title="Environment Variables">
+    | Name | Source | Description |
+    |---|---|---|
+    | `ORIGINS` | `CloudFrontDistribution.DomainName` | Allowed CORS origin (CloudFront domain) |
+    | `ENVIRONMENT` | `Environment` parameter | Active environment name |
+  </Tab>
+  <Tab title="Secrets (SSM)">
+    | Secret name | SSM parameter | Description |
+    |---|---|---|
+    | `JWT_SECRET` | `JWTSecretParameterName` | JWT signing/verification key |
+  </Tab>
+  <Tab title="Health Check">
+    ```
+    CMD-SHELL: wget -qO- http://localhost:80/api/health || exit 1
+    ```
+    | Setting | Value |
+    |---|---|
+    | Interval | 30 s |
+    | Timeout | 10 s |
+    | Retries | 3 |
+    | Start period | 120 s |
+  </Tab>
+</Tabs>
+
+---
+
+## Auth Service
+
+The auth service handles authentication and token issuance. It is reachable from other containers via the Docker bridge network on port 8081.
+
+<Tabs>
+  <Tab title="Identity">
+    | Property | Value |
+    |---|---|
+    | Container name | `gmsauth` |
+    | Task family | `{env}-{appName}-auth-task` |
+    | ECS service name | `{env}-{appName}-auth-service` |
+    | ECR image tag | `auth-latest` |
+    | Image URI | `{ecr-repo}:auth-latest` |
+  </Tab>
+  <Tab title="Port Mapping">
+    | Container port | Host port | Protocol |
+    |---|---|---|
+    | 8081 | 8081 | tcp |
+  </Tab>
+  <Tab title="Environment Variables">
+    | Name | Source | Description |
+    |---|---|---|
+    | `ENVIRONMENT` | `Environment` parameter | Active environment name |
+  </Tab>
+  <Tab title="Secrets (SSM)">
+    | Secret name | SSM parameter | Description |
+    |---|---|---|
+    | `JWT_SECRET` | `JWTSecretParameterName` | JWT signing/verification key |
+    | `DB_MASTER_URL` | `DBMasterUrlParameterName` | Database connection string |
+  </Tab>
+  <Tab title="Health Check">
+    ```
+    CMD-SHELL: wget -qO- http://localhost:8081/health || exit 1
+    ```
+    | Setting | Value |
+    |---|---|
+    | Interval | 30 s |
+    | Timeout | 10 s |
+    | Retries | 3 |
+    | Start period | 120 s |
+  </Tab>
+</Tabs>
+
+---
+
+## Application Service
+
+The application service implements core business logic. It listens on port 8082 and is accessible to other containers through the Docker bridge.
+
+<Tabs>
+  <Tab title="Identity">
+    | Property | Value |
+    |---|---|
+    | Container name | `gsmapplication` |
+    | Task family | `{env}-{appName}-application-task` |
+    | ECS service name | `{env}-{appName}-application-service` |
+    | ECR image tag | `application-latest` |
+    | Image URI | `{ecr-repo}:application-latest` |
+  </Tab>
+  <Tab title="Port Mapping">
+    | Container port | Host port | Protocol |
+    |---|---|---|
+    | 8082 | 8082 | tcp |
+  </Tab>
+  <Tab title="Environment Variables">
+    | Name | Source | Description |
+    |---|---|---|
+    | `ENVIRONMENT` | `Environment` parameter | Active environment name |
+  </Tab>
+  <Tab title="Secrets (SSM)">
+    | Secret name | SSM parameter | Description |
+    |---|---|---|
+    | `JWT_SECRET` | `JWTSecretParameterName` | JWT signing/verification key |
+    | `DB_MASTER_URL` | `DBMasterUrlParameterName` | Database connection string |
+  </Tab>
+  <Tab title="Health Check">
+    ```
+    CMD-SHELL: wget -qO- http://localhost:8082/health || exit 1
+    ```
+    | Setting | Value |
+    |---|---|
+    | Interval | 30 s |
+    | Timeout | 10 s |
+    | Retries | 3 |
+    | Start period | 120 s |
+  </Tab>
+</Tabs>
+
+---
+
+## Operations Service
+
+The operations service handles administrative and operational workflows. It listens on port 8083 and shares the same secret profile as the auth and application services.
+
+<Tabs>
+  <Tab title="Identity">
+    | Property | Value |
+    |---|---|
+    | Container name | `gsmoperations` |
+    | Task family | `{env}-{appName}-operations-task` |
+    | ECS service name | `{env}-{appName}-operations-service` |
+    | ECR image tag | `gsmoperations-latest` |
+    | Image URI | `{ecr-repo}:gsmoperations-latest` |
+  </Tab>
+  <Tab title="Port Mapping">
+    | Container port | Host port | Protocol |
+    |---|---|---|
+    | 8083 | 8083 | tcp |
+  </Tab>
+  <Tab title="Environment Variables">
+    | Name | Source | Description |
+    |---|---|---|
+    | `ENVIRONMENT` | `Environment` parameter | Active environment name |
+  </Tab>
+  <Tab title="Secrets (SSM)">
+    | Secret name | SSM parameter | Description |
+    |---|---|---|
+    | `JWT_SECRET` | `JWTSecretParameterName` | JWT signing/verification key |
+    | `DB_MASTER_URL` | `DBMasterUrlParameterName` | Database connection string |
+  </Tab>
+  <Tab title="Health Check">
+    ```
+    CMD-SHELL: wget -qO- http://localhost:8083/health || exit 1
+    ```
+    | Setting | Value |
+    |---|---|
+    | Interval | 30 s |
+    | Timeout | 10 s |
+    | Retries | 3 |
+    | Start period | 120 s |
+  </Tab>
+</Tabs>
+
+---
+
+## Pushing Images to ECR
+
+Before ECS can pull a container image, you must authenticate Docker to the ECR registry, tag your local image with the repository URI, and push it. The ECR repository name follows the pattern `{env}-{appName}-respository` (e.g. `dev-gsmapplication-respository`).
+
+```bash
+# Authenticate Docker to ECR
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com
+
+# Tag and push gateway image
+docker tag my-gateway:latest \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:gateway-latest
+docker push \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:gateway-latest
+
+# Tag and push auth image
+docker tag my-auth:latest \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:auth-latest
+docker push \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:auth-latest
+
+# Tag and push application image
+docker tag my-application:latest \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:application-latest
+docker push \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:application-latest
+
+# Tag and push operations image
+docker tag my-operations:latest \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:gsmoperations-latest
+docker push \
+  <account-id>.dkr.ecr.us-east-1.amazonaws.com/dev-gsmapplication-respository:gsmoperations-latest
+```
+
+<Tip>
+  After pushing a new image, force a new ECS deployment to pick it up:
+
+  ```bash
+  aws ecs update-service \
+    --cluster dev-gsmapplication-cluster \
+    --service dev-gsmapplication-gateway-service \
+    --force-new-deployment \
+    --region us-east-1
+  ```
+</Tip>

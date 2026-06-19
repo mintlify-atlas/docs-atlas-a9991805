@@ -1,0 +1,99 @@
+---
+title: "Deploy the Base Stack: OIDC Provider and IAM Role"
+sidebarTitle: "Base Setup"
+description: "Deploy the GSM Infrastructure base CloudFormation stack to create the GitHub OIDC provider and least-privilege IAM executor role for keyless CI/CD authentication."
+---
+
+The base stack (`devops/base/template.yml`) is the foundation of the entire GSM Infrastructure deployment pipeline. It must be deployed **manually, once**, before the GitHub Actions workflows can authenticate with AWS. Without it, the workflows have no IAM role to assume and every push to a tracked branch will fail at the credential configuration step.
+
+The stack creates two resources: a **GitHub OIDC Provider** that allows GitHub Actions runners to exchange a short-lived OIDC token for temporary AWS credentials, and an **`InfraExecutorRole`** with scoped policies covering CloudFormation, ECS, EC2, ECR, S3, CloudFront, Lambda, EventBridge Scheduler, and more. No long-lived AWS access keys are ever stored in GitHub.
+
+<Warning>
+  If a GitHub OIDC provider for `token.actions.githubusercontent.com` already exists in your AWS account (only one is allowed per account per URL), set `CreateOIDCProvider=false`. Attempting to create a second provider will cause the stack to fail with a resource conflict error. The role will still be created and will reference the existing provider automatically.
+</Warning>
+
+## Stack parameters
+
+| Parameter | Default | Allowed values | Description |
+|-----------|---------|----------------|-------------|
+| `Environment` | `dev` | `dev`, `qa`, `prod` | Deployment environment tag; used as a prefix in the role name |
+| `AppName` | `GSMApplication` | Any string | Application name incorporated into all resource names |
+| `GitHubOrg` | _(required)_ | Your org or username | GitHub organization or username that owns the repository |
+| `GitHubRepo` | _(required)_ | Repo name or `*` | Repository name; use `*` to allow any repo in the organization to assume the role |
+| `GitHubBranch` | `main` | Branch name or `*` | The branch authorized to assume the role; use `*` to allow any branch |
+| `CreateOIDCProvider` | `true` | `true`, `false` | Whether to create the GitHub OIDC provider; set to `false` if one already exists in the account |
+
+<Tip>
+  Deploy one base stack per environment (dev, qa, prod) by repeating the command below with the appropriate `Environment` value. Each environment gets its own `InfraExecutorRole` with the environment prefix, so policies stay scoped correctly (e.g., `dev-*` resources vs. `prod-*` resources).
+</Tip>
+
+## Deploy with AWS CLI
+
+Run the following command from the root of the repository. Substitute your own values for `GitHubOrg`, `GitHubRepo`, and the `Environment` / `AppName` you are targeting.
+
+```bash
+aws cloudformation deploy \
+  --template-file devops/base/template.yml \
+  --stack-name prod-gsmapplication-base-stack \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+    Environment=prod \
+    AppName=gsmapplication \
+    GitHubOrg=ti-infinite \
+    GitHubRepo=GSMInfrastructure \
+    GitHubBranch=main \
+    CreateOIDCProvider=true
+```
+
+<Steps>
+  <Step title="Authenticate with AWS CLI">
+    Make sure your local AWS credentials have permissions to create IAM roles, IAM policies, and (optionally) an OIDC provider. An admin role or a role with `iam:*` and `iam:CreateOpenIDConnectProvider` is sufficient for this one-time operation.
+  </Step>
+  <Step title="Run the deploy command">
+    Execute the `aws cloudformation deploy` command shown above. CloudFormation will create a change set, print progress events to stdout, and exit `0` on success. The deploy typically completes in under two minutes.
+  </Step>
+  <Step title="Verify the stack">
+    In the AWS Console, navigate to **CloudFormation → Stacks** and confirm the stack status is `CREATE_COMPLETE`. Open the **Outputs** tab to retrieve the role ARN.
+  </Step>
+  <Step title="Copy outputs to GitHub">
+    Copy the `InfraRoleArn` output value and add it as the `AWS_INFRA_ROLE_ARN` secret in your GitHub repository (see [After deployment](#after-deployment) below).
+  </Step>
+</Steps>
+
+## Stack outputs
+
+Once the stack reaches `CREATE_COMPLETE`, the following outputs are available in the CloudFormation Console under the stack's **Outputs** tab:
+
+| Output key | Description |
+|------------|-------------|
+| `InfraRoleArn` | Full ARN of the created `InfraExecutorRole`. **Copy this value into the `AWS_INFRA_ROLE_ARN` GitHub secret.** Both the infrastructure and scheduler workflows use it as `role-to-assume`. |
+| `InfraRoleName` | Short name of the role (e.g., `prod-gsmapplication-infrastructure-role`). Useful for referencing the role in other stacks or manual CLI commands. |
+| `OIDCProviderArn` | ARN of the newly created GitHub OIDC provider. Only present when `CreateOIDCProvider=true`. Save this if you need to reference the provider in other IAM trust policies. |
+
+## After deployment
+
+<Steps>
+  <Step title="Add AWS_INFRA_ROLE_ARN to GitHub secrets">
+    Go to your repository on GitHub → **Settings → Secrets and variables → Actions → Secrets → New repository secret**.
+
+    - **Name:** `AWS_INFRA_ROLE_ARN`
+    - **Value:** the `InfraRoleArn` output from the base stack
+
+    Alternatively, add the secret at the environment level (under **Settings → Environments → infra-prod → Secrets**) if you want per-environment role ARNs.
+  </Step>
+  <Step title="Create GitHub environments">
+    Navigate to **Settings → Environments** in your repository and create the following environments:
+
+    | Environment name | Branch protection suggestion |
+    |-----------------|------------------------------|
+    | `infra-dev` | No required reviewers |
+    | `infra-qa` | Optional: 1 reviewer |
+    | `infra-prod` | Recommended: required reviewers + wait timer |
+
+    The workflows reference `infra-${{ env }}` dynamically, so the names must match exactly.
+  </Step>
+  <Step title="Set repository variables">
+    With the environments created and the secret in place, proceed to configure all required repository variables. See the [Configuration](/getting-started/configuration) page for the full list.
+  </Step>
+</Steps>

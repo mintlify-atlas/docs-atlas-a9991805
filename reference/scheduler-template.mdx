@@ -1,0 +1,373 @@
+---
+title: "Scheduler Template Reference: Lambda Start/Stop and EventBridge"
+sidebarTitle: "Scheduler Template"
+description: "Complete parameter, resource, and output reference for devops/scheduler/template.yml — the EventBridge Scheduler and Lambda start/stop CloudFormation stack."
+---
+
+The scheduler template (`devops/scheduler/template.yml`) automates cost savings by shutting down and restarting the GSM platform's EC2 ECS host on a weekday schedule aligned to Colombia Time (COT, UTC−5). Two Python Lambda functions handle the stop and start sequences: the stop function scales all four ECS services to zero, disassociates the Elastic IP (to avoid idle EIP charges), and stops the EC2 instance; the start function reverses the sequence — starts the instance, waits for it to reach the `running` state, reassociates the EIP, then scales ECS services back to one. An EventBridge Scheduler group drives both functions on configurable cron expressions.
+
+## Parameters
+
+<ParamField path="Environment" type="String" default="dev">
+  The deployment environment. Used to prefix all resource names.
+
+  **Allowed values:** `dev`, `qa`, `prod`
+</ParamField>
+
+<ParamField path="AppName" type="String" default="GSMApplication">
+  The application name. Combined with `Environment` in all Lambda, role, schedule, and log group names.
+</ParamField>
+
+<ParamField path="EC2InstanceId" type="AWS::EC2::Instance::Id" required>
+  The ID of the ECS host EC2 instance to stop and start (e.g. `i-0abc123def456`). Passed to both Lambda functions as the `INSTANCE_ID` environment variable.
+</ParamField>
+
+<ParamField path="EIPAllocationId" type="String" required>
+  The allocation ID of the Elastic IP (e.g. `eipalloc-0abc123def456`). The EIP is disassociated before the instance shuts down and reassociated after it starts up, preventing the idle-EIP hourly charge. Passed to both Lambda functions as the `EIP_ALLOCATION_ID` environment variable.
+</ParamField>
+
+<ParamField path="ECSClusterName" type="String" default="dev-cluster">
+  Name of the ECS cluster that contains the services to scale. Passed to both Lambda functions as the `CLUSTER_NAME` environment variable. Use the `ECSClusterName` output from the infrastructure stack.
+</ParamField>
+
+<ParamField path="GatewayServiceName" type="String" default="dev-gateway-service">
+  Name of the ECS Gateway service to scale down/up.
+</ParamField>
+
+<ParamField path="AuthServiceName" type="String" default="dev-auth-service">
+  Name of the ECS Auth service to scale down/up.
+</ParamField>
+
+<ParamField path="ApplicationServiceName" type="String" default="dev-application-service">
+  Name of the ECS Application service to scale down/up.
+</ParamField>
+
+<ParamField path="OperationsServiceName" type="String" default="dev-operations-service">
+  Name of the ECS Operations service to scale down/up.
+</ParamField>
+
+<ParamField path="SchedulerStartExpression" type="String" default="cron(0 9 ? * MON-SAT *)">
+  EventBridge Scheduler cron expression (UTC) for the start schedule. The default fires at 09:00 UTC on Monday–Saturday, which corresponds to 04:00 AM COT.
+</ParamField>
+
+<ParamField path="SchedulerStopExpression" type="String" default="cron(0 1 ? * MON-SAT *)">
+  EventBridge Scheduler cron expression (UTC) for the stop schedule. The default fires at 01:00 UTC on Monday–Saturday, which corresponds to 08:00 PM COT the previous evening.
+</ParamField>
+
+## Resources
+
+### SchedulerLambdaRole
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Role` |
+| **Name pattern** | `{Environment}-{AppName}-scheduler-lambda-role` |
+| **Trusted by** | `lambda.amazonaws.com` |
+| **Managed policy** | `AWSLambdaBasicExecutionRole` (CloudWatch Logs write access) |
+
+Inline policy `EC2EIPECSAccess` grants the following permissions (all resources — `*`):
+
+| Service | Actions |
+|---|---|
+| **EC2** | `StopInstances`, `StartInstances`, `DescribeInstances`, `DescribeInstanceStatus` |
+| **EC2 (EIP)** | `AssociateAddress`, `DisassociateAddress`, `DescribeAddresses` |
+| **ECS** | `UpdateService`, `DescribeServices` |
+
+---
+
+### StopFunction
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Lambda::Function` |
+| **Name pattern** | `{Environment}-{AppName}-ec2-stop` |
+| **Runtime** | `python3.12` |
+| **Architecture** | `arm64` |
+| **Handler** | `index.handler` |
+| **Timeout** | 120 seconds |
+| **Role** | `SchedulerLambdaRole` |
+
+Scales all ECS services to `desiredCount=0`, waits 10 seconds for the ECS agent to process the scale-down, disassociates the Elastic IP, then stops the EC2 instance.
+
+```python
+import boto3
+import os
+import time
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+ec2 = boto3.client('ec2')
+ecs = boto3.client('ecs')
+
+INSTANCE_ID      = os.environ['INSTANCE_ID']
+EIP_ALLOC_ID     = os.environ['EIP_ALLOCATION_ID']
+CLUSTER          = os.environ['CLUSTER_NAME']
+SERVICES         = [
+    os.environ['GATEWAY_SERVICE'],
+    os.environ['AUTH_SERVICE'],
+    os.environ['APPLICATION_SERVICE'],
+    os.environ['OPERATIONS_SERVICE'],
+]
+
+def scale_ecs(desired):
+    for svc in SERVICES:
+        try:
+            resp = ecs.update_service(
+                cluster=CLUSTER,
+                service=svc,
+                desiredCount=desired
+            )
+            logger.info(f"ECS {svc} → desiredCount={desired}")
+        except Exception as e:
+            logger.warning(f"No se pudo escalar {svc}: {e}")
+
+def disassociate_eip():
+    try:
+        addrs = ec2.describe_addresses(AllocationIds=[EIP_ALLOC_ID])['Addresses']
+        if not addrs:
+            logger.info("EIP no encontrada, nada que desasociar")
+            return
+        assoc_id = addrs[0].get('AssociationId')
+        if assoc_id:
+            ec2.disassociate_address(AssociationId=assoc_id)
+            logger.info(f"EIP desasociada: AssociationId={assoc_id}")
+        else:
+            logger.info("EIP ya estaba desasociada")
+    except Exception as e:
+        logger.error(f"Error desasociando EIP: {e}")
+        raise
+
+def stop_instance():
+    resp = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+    state = resp['Reservations'][0]['Instances'][0]['State']['Name']
+    if state in ('stopped', 'stopping'):
+        logger.info(f"Instancia ya en estado {state}, skip stop")
+        return
+    ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+    logger.info(f"Instancia {INSTANCE_ID} detenida")
+
+def handler(event, context):
+    logger.info(f"=== STOP iniciado. Evento: {event} ===")
+
+    # 1. Escalar ECS a 0 para drenar contenedores
+    scale_ecs(0)
+
+    # 2. Esperar brevemente para que ECS procese el scale-down
+    time.sleep(10)
+
+    # 3. Desasociar EIP antes de apagar (evita cobro de idle IP)
+    disassociate_eip()
+
+    # 4. Detener la instancia EC2
+    stop_instance()
+
+    return {'statusCode': 200, 'body': 'Stop completado'}
+```
+
+---
+
+### StartFunction
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Lambda::Function` |
+| **Name pattern** | `{Environment}-{AppName}-ec2-start` |
+| **Runtime** | `python3.12` |
+| **Architecture** | `arm64` |
+| **Handler** | `index.handler` |
+| **Timeout** | 300 seconds |
+| **Role** | `SchedulerLambdaRole` |
+
+Starts the EC2 instance, waits for the `instance_running` waiter (polling every 10 seconds, up to 30 attempts), reassociates the Elastic IP, then waits 30 seconds for the ECS agent to register before scaling all services to `desiredCount=1`.
+
+```python
+import boto3
+import os
+import time
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO) 
+
+ec2 = boto3.client('ec2')
+ecs = boto3.client('ecs')
+
+INSTANCE_ID  = os.environ['INSTANCE_ID']
+EIP_ALLOC_ID = os.environ['EIP_ALLOCATION_ID']
+CLUSTER      = os.environ['CLUSTER_NAME']
+SERVICES     = [
+    os.environ['GATEWAY_SERVICE'],
+    os.environ['AUTH_SERVICE'],
+    os.environ['APPLICATION_SERVICE'],
+    os.environ['OPERATIONS_SERVICE'],
+]
+
+def start_instance():
+    resp = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+    state = resp['Reservations'][0]['Instances'][0]['State']['Name']
+    if state == 'running':
+        logger.info("Instancia ya está running")
+        return
+    if state not in ('stopped',):
+        logger.info(f"Instancia en estado {state}, esperando stopped...")
+        waiter = ec2.get_waiter('instance_stopped')
+        waiter.wait(InstanceIds=[INSTANCE_ID],
+                    WaiterConfig={'Delay': 10, 'MaxAttempts': 30})
+    ec2.start_instances(InstanceIds=[INSTANCE_ID])
+    logger.info(f"Instancia {INSTANCE_ID} iniciada, esperando running...")
+
+def wait_running():
+    waiter = ec2.get_waiter('instance_running')
+    waiter.wait(
+        InstanceIds=[INSTANCE_ID],
+        WaiterConfig={'Delay': 10, 'MaxAttempts': 30}
+    )
+    logger.info("Instancia en estado running")
+
+def associate_eip():
+    addrs = ec2.describe_addresses(AllocationIds=[EIP_ALLOC_ID])['Addresses']
+    if addrs and addrs[0].get('InstanceId') == INSTANCE_ID:
+        logger.info("EIP ya asociada a esta instancia")
+        return
+    resp = ec2.associate_address(
+        InstanceId=INSTANCE_ID,
+        AllocationId=EIP_ALLOC_ID,
+        AllowReassociation=True
+    )
+    logger.info(f"EIP reasociada: AssociationId={resp['AssociationId']}")
+
+def scale_ecs(desired):
+    # Esperar que el agente ECS esté registrado en el cluster
+    time.sleep(30)
+    for svc in SERVICES:
+        try:
+            ecs.update_service(
+                cluster=CLUSTER,
+                service=svc,
+                desiredCount=desired
+            )
+            logger.info(f"ECS {svc} → desiredCount={desired}")
+        except Exception as e:
+            logger.warning(f"No se pudo escalar {svc}: {e}")
+
+def handler(event, context):
+    logger.info(f"=== START iniciado. Evento: {event} ===")
+
+    # 1. Encender EC2
+    start_instance()
+
+    # 2. Esperar a running
+    wait_running()
+
+    # 3. Reasociar EIP (la IP pública no cambia)
+    associate_eip()
+
+    # 4. Escalar ECS a 1 (el agente ECS ya está activo)
+    scale_ecs(1)
+
+    return {'statusCode': 200, 'body': 'Start completado'}
+```
+
+---
+
+### StopFunctionLogGroup / StartFunctionLogGroup
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Logs::LogGroup` |
+| **Retention** | 14 days |
+| **Deletion policy** | `Delete` |
+
+| Resource | Log group name pattern |
+|---|---|
+| `StopFunctionLogGroup` | `/aws/lambda/{Environment}-{AppName}-ec2-stop` |
+| `StartFunctionLogGroup` | `/aws/lambda/{Environment}-{AppName}-ec2-start` |
+
+---
+
+### SchedulerExecutionRole
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Role` |
+| **Name pattern** | `{Environment}-{AppName}-eventbridge-scheduler-role` |
+| **Trusted by** | `scheduler.amazonaws.com` |
+
+Inline policy `InvokeLambdas` grants `lambda:InvokeFunction` on both `StopFunction.Arn` and `StartFunction.Arn`.
+
+---
+
+### SchedulerGroup
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Scheduler::ScheduleGroup` |
+| **Name pattern** | `{Environment}-{AppName}-ec2-schedules` |
+
+Groups the stop and start schedules together for easier management and filtering in the AWS Console.
+
+---
+
+### StopScheduleWeekdays
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Scheduler::Schedule` |
+| **Name pattern** | `{Environment}-{AppName}-stop-lun-sab` |
+| **Expression** | `SchedulerStopExpression` (default: `cron(0 1 ? * MON-SAT *)`) |
+| **Timezone** | UTC |
+| **Target** | `StopFunction` |
+| **Retry policy** | 2 maximum retry attempts; 3600 seconds maximum event age |
+| **Input** | `{"action": "stop", "trigger": "weekday-night"}` |
+
+---
+
+### StartScheduleWeekdays
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Scheduler::Schedule` |
+| **Name pattern** | `{Environment}-{AppName}-start-lun-sab` |
+| **Expression** | `SchedulerStartExpression` (default: `cron(0 9 ? * MON-SAT *)`) |
+| **Timezone** | UTC |
+| **Target** | `StartFunction` |
+| **Retry policy** | 2 maximum retry attempts; 3600 seconds maximum event age |
+| **Input** | `{"action": "start", "trigger": "weekday-morning"}` |
+
+---
+
+### StopFunctionPermission / StartFunctionPermission
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Lambda::Permission` |
+| **Action** | `lambda:InvokeFunction` |
+| **Principal** | `scheduler.amazonaws.com` |
+| **Source ARN** | `arn:aws:scheduler:{region}:{account}:schedule/{SchedulerGroup}/*` |
+
+Resource-based policy entries that authorize EventBridge Scheduler to invoke each Lambda function. Scoped to schedules within the `SchedulerGroup` to prevent cross-group invocation.
+
+## Lambda environment variables
+
+Both `StopFunction` and `StartFunction` receive an identical set of environment variables:
+
+| Variable | Source | Description |
+|---|---|---|
+| `INSTANCE_ID` | `EC2InstanceId` parameter | The EC2 instance ID (e.g. `i-0abc123def456`) to stop or start. Used in all `ec2` API calls that target a specific instance. |
+| `EIP_ALLOCATION_ID` | `EIPAllocationId` parameter | The Elastic IP allocation ID (e.g. `eipalloc-0abc123`). Used to disassociate the EIP before shutdown and reassociate it after the instance reaches the `running` state. |
+| `CLUSTER_NAME` | `ECSClusterName` parameter | The ECS cluster name that contains the four microservice services (e.g. `dev-gsmapplication-cluster`). |
+| `GATEWAY_SERVICE` | `GatewayServiceName` parameter | Name of the ECS Gateway service passed to `ecs:UpdateService` for scale-down/up. |
+| `AUTH_SERVICE` | `AuthServiceName` parameter | Name of the ECS Auth service passed to `ecs:UpdateService` for scale-down/up. |
+| `APPLICATION_SERVICE` | `ApplicationServiceName` parameter | Name of the ECS Application service passed to `ecs:UpdateService` for scale-down/up. |
+| `OPERATIONS_SERVICE` | `OperationsServiceName` parameter | Name of the ECS Operations service passed to `ecs:UpdateService` for scale-down/up. |
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `StopFunctionArn` | ARN of the `StopFunction` Lambda. Use to verify the function was created or to invoke it manually for testing. |
+| `StartFunctionArn` | ARN of the `StartFunction` Lambda. Use to verify the function was created or to invoke it manually for testing. |
+| `SchedulerGroupName` | Name of the EventBridge Scheduler group (e.g. `dev-GSMApplication-ec2-schedules`). |
+| `HorarioCOT` | Human-readable summary of the configured schedule: `Stop Lun-Sab 9pm COT \| Start Lun-Sab 7am COT`. |

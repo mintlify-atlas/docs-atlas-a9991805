@@ -1,0 +1,130 @@
+---
+title: "Networking Reference: Security Groups, CloudFront Routing, and VPC"
+sidebarTitle: "Networking"
+description: "Network architecture reference for GSM Infrastructure: ECS security group rules, CloudFront cache behaviors, VPC placement, and Elastic IP configuration."
+---
+
+GSM Infrastructure uses a layered network topology that keeps the EC2 instance off the public internet while still routing external HTTPS traffic to it through CloudFront. Clients connect exclusively to a CloudFront distribution; CloudFront serves static frontend assets from S3 and proxies API calls to the EC2 instance via an Elastic IP. The EC2 instance runs all four ECS containers using Docker's bridge network — containers communicate with each other over the `172.17.0.0/16` bridge range without traversing the VPC fabric. The ECS security group enforces strict ingress and egress rules to limit the blast radius of any compromise.
+
+## Traffic Flow
+
+The full request path for a browser client is:
+
+1. **User → CloudFront (HTTPS)** — All client traffic arrives at the CloudFront distribution. CloudFront terminates TLS and applies cache behavior routing based on the request path.
+
+2. **Static assets (`/*` default behavior) → S3** — Requests that do not match `/api/*` are served from the S3 frontend bucket via Origin Access Control (OAC). The S3 origin path is `/admin`, so a request for `/*` maps to `s3://bucket/admin/*`. The bucket blocks all public access; only CloudFront's OAC identity can call `s3:GetObject`.
+
+3. **API requests (`/api/*`) → EC2 via Elastic IP (HTTP, port 80)** — Requests matching the `/api/*` cache behavior are forwarded to the EC2 public DNS hostname (the Elastic IP). CloudFront communicates with the origin over HTTP on port 80 and sends a custom header (`X-CloudFront-Origin`) so the gateway can verify the request came through CloudFront.
+
+4. **EC2 (port 80) → `gsmgateway` container → internal services** — The gateway container listens on host port 80 (bridge mode). It routes requests to the auth (8081), application (8082), and operations (8083) containers over the Docker bridge network (`172.17.0.0/16`). These backend ports are **not** exposed to the VPC — only to the bridge.
+
+<Info>
+  The EC2 instance is placed in a **private subnet** (`PrivateSubnet1Id`). It has no public subnet or internet gateway attachment. Inbound internet traffic reaches it only via the CloudFront → Elastic IP path.
+</Info>
+
+## CloudFront Cache Behaviors
+
+The distribution defines two cache behaviors, evaluated in order of specificity:
+
+| Path pattern | Origin | Viewer protocol | Query string | Cache TTL |
+|---|---|---|---|---|
+| `/api/*` | EC2 (via Elastic IP) | HTTPS only | Forwarded | MinTTL/DefaultTTL/MaxTTL = 0 (pass-through) |
+| `/*` (default) | S3 (OAC, path `/admin`) | Redirect to HTTPS | Not forwarded | CloudFront defaults |
+
+**API cache behavior forwarded values:**
+
+The `/api/*` behavior forwards the following headers to the EC2 origin so that the backend receives the full request context:
+
+| Header |
+|---|
+| `Authorization` |
+| `Content-Type` |
+| `Accept` |
+| `Origin` |
+| `Referer` |
+
+All cookies are also forwarded (`Forward: all`). TTLs are set to zero to ensure API responses are never cached at the edge — every request reaches the EC2 origin.
+
+**Allowed methods for the API behavior:** `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT`
+
+<Info>
+  The default (`/*`) behavior only allows `GET`, `HEAD`, and `OPTIONS` because static assets are read-only. Compress is enabled on the default behavior to reduce S3 → CloudFront → browser payload sizes.
+</Info>
+
+## SPA Router Function
+
+A CloudFront Function (`cloudfront-js-2.0` runtime) is attached to the **viewer request** event of the default cache behavior. It rewrites extensionless URI paths to `/index.html`, enabling client-side routing for the single-page application without returning 403/404 errors from S3.
+
+```javascript
+function handler(event) {
+    var request = event.request;
+    var lastSegment = request.uri.split('/').pop();
+    if (!lastSegment.includes('.')) {
+        request.uri = '/index.html';
+    }
+    return request;
+}
+```
+
+The function checks whether the last path segment contains a `.` (file extension). If it does not — e.g. `/dashboard`, `/users/123` — the URI is rewritten to `/index.html` before S3 is consulted. Requests for actual files like `/main.js` or `/logo.png` pass through unchanged.
+
+**CloudFormation resource name:** `{env}-{appName}-spa-router`
+
+## ECS Security Group
+
+The security group `{env}-{appName}-ecs-security-group` is attached to the EC2 instance. It enforces the principle of least privilege: only the ports and sources that services actually need are permitted.
+
+### Ingress Rules
+
+| Protocol | Port(s) | Source | Purpose |
+|---|---|---|---|
+| TCP | 80 | `pl-3b927c52` (CloudFront managed prefix list) | CloudFront edge nodes → gateway container |
+| TCP | 80 | `VpcIdCidrBlock` | VPC-internal access (e.g. load balancers, VPC endpoints) |
+| TCP | 8081–8083 | `172.17.0.0/16` | Docker bridge inter-container communication |
+
+<Info>
+  `pl-3b927c52` is the AWS-managed prefix list for CloudFront edge IP ranges in `us-east-1`. Using a prefix list instead of `0.0.0.0/0` prevents direct internet access to port 80, ensuring traffic on that port can only originate from CloudFront.
+</Info>
+
+### Egress Rules
+
+| Protocol | Port(s) | Destination | Purpose |
+|---|---|---|---|
+| TCP | 443 | `0.0.0.0/0` | HTTPS outbound — SSM Agent, ECR image pulls, AWS API calls |
+| UDP | 53 | `0.0.0.0/0` | DNS resolution |
+| TCP | 8081–8083 | `172.17.0.0/16` | Docker bridge return traffic to backend containers |
+| TCP | `DBPortParameterName` | `SqlServerProviderIp` | Outbound to the SQL Server database host |
+
+<Warning>
+  The database egress rule uses the `DBPortParameterName` (default `1433`) and `SqlServerProviderIp` parameters. If your SQL Server is hosted outside AWS (e.g. a managed provider), supply the correct CIDR block for `SqlServerProviderIp` — the default `0.0.0.0/0` is intentionally permissive and should be tightened for production.
+</Warning>
+
+## VPC Placement
+
+The EC2 instance is launched into the subnet identified by the `PrivateSubnet1Id` parameter. Key placement characteristics:
+
+- **Private subnet only** — no public IP is assigned by the instance profile; the instance is unreachable directly from the internet.
+- **Elastic IP provides external reachability** — the EIP is associated with the instance at CloudFormation deploy time and serves as the CloudFront backend origin address.
+- **No NAT Gateway dependency for inbound traffic** — CloudFront → EIP → EC2 flows without NAT.
+- **Outbound HTTPS** (ECR pulls, SSM, AWS APIs) requires either a NAT Gateway or VPC Endpoints in the subnet's route table. The security group egress permits TCP 443; routing is left to the existing VPC configuration.
+
+<Info>
+  The EC2 AMI is resolved dynamically from SSM:
+  `{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id}}`
+
+  This ensures the instance always launches with the latest ECS-optimized Amazon Linux 2023 ARM64 image. The default instance type `t4g.medium` is an ARM Graviton2 instance — ensure your container images are built for `linux/arm64`.
+</Info>
+
+## Elastic IP
+
+The `Ec2ElasticIp` resource (`{env}-{appName}-ec2-eip`) is an EIP allocated in the VPC domain and associated with the EC2 instance at stack creation time. It plays three roles in the architecture:
+
+1. **Stable CloudFront origin** — CloudFront requires a stable hostname for the EC2 origin. The EIP's DNS name does not change between instance stops/starts, so CloudFront's origin configuration remains valid across scheduler cycles.
+
+2. **Cost management with the scheduler** — When the EventBridge scheduler stops the infrastructure at the end of the business day, it **disassociates** the EIP from the instance before stopping it. This avoids the AWS charge for an EIP that is allocated but not attached to a running instance. When the scheduler starts the infrastructure the next morning, it **re-associates** the EIP to the newly started instance.
+
+3. **Existing EIP support** — The `ExistingEIPPublicIp` parameter allows you to supply an EIP that was allocated outside this stack (e.g. to preserve a whitelisted IP address). When set, CloudFormation uses the existing EIP's public DNS as the CloudFront origin instead of creating a new one.
+
+<Info>
+  After the scheduler re-associates the EIP on startup, there may be a brief period (typically under 60 seconds) before the ECS services pass their health checks and begin serving traffic. The `HealthCheckGracePeriodSeconds: 60` setting on each ECS service accommodates this startup delay.
+</Info>

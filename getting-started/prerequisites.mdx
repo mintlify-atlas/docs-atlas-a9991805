@@ -1,0 +1,140 @@
+---
+title: "Prerequisites for GSM Infrastructure Deployment"
+sidebarTitle: "Prerequisites"
+description: "Everything you need before deploying GSM Infrastructure: AWS account, VPC, subnets, EC2 key pair, SSM parameters, GitHub repo variables, and required tools."
+---
+
+Before running any CloudFormation deployment for GSM Infrastructure, make sure every item on this page is in place. The stacks build on top of existing AWS resources and GitHub configuration — skipping any prerequisite will cause the deployment to fail mid-way and leave partial resources behind.
+
+## AWS account requirements
+
+All GSM Infrastructure stacks deploy into the **`us-east-1`** region. Your AWS account must already contain:
+
+- An existing **VPC** whose ID you will supply as the `VpcId` parameter
+- A **private subnet** inside that VPC (`PrivateSubnet1Id`) in at least one Availability Zone — the ECS EC2 instance is launched into this subnet
+- Sufficient IAM permissions to create stacks with `CAPABILITY_IAM` and `CAPABILITY_NAMED_IAM` (the base stack provisions the executor role that handles all subsequent deployments)
+
+## Required tools
+
+| Tool | Purpose |
+|------|---------|
+| **AWS CLI v2** | Deploy the base stack manually before GitHub Actions can take over |
+| **AWS Console or CloudFormation CLI** | Inspect stack events, outputs, and drift |
+| **GitHub Actions** | Automated deployment; runners use `ubuntu-latest` |
+
+The ongoing infrastructure and scheduler stacks are deployed exclusively via GitHub Actions once the base stack is in place. You only need the AWS CLI for the one-time base stack setup.
+
+## EC2 key pair
+
+The infrastructure stack launches an ECS-optimized EC2 instance. A **pre-existing EC2 key pair** must exist in `us-east-1` before deploying. Its name is passed via the `Ec2PenKeyName` parameter (default: `dev-key-ec2`).
+
+Set the `KEYPEM_EC2_NAME` GitHub repository variable to match the exact name of your key pair in AWS.
+
+## SSM Parameter Store values
+
+<Warning>
+  These two SSM parameters must exist in Parameter Store **before** the infrastructure stack is deployed. The ECS task definitions reference them directly via `ValueFrom` — if either parameter is missing, all container startups will fail and the deploy will roll back.
+</Warning>
+
+Create the following parameters under your target environment prefix (replace `{env}` with `dev`, `qa`, or `prod`):
+
+| Parameter path | Description | Workflow variable |
+|----------------|-------------|-------------------|
+| `{env}/backend/DB_MASTER_URL` | Full database connection string for the SQL Server master database | `DB_MASTER_URL_PARAM` |
+| `{env}/backend/JWT_SECRET` | Secret key used to sign and verify JWT tokens | `JWT_SECRET_PARAM` |
+
+Use the `SecureString` type and encrypt with the default AWS-managed KMS key so the ECS execution role can decrypt them at task startup.
+
+## GitHub repository variables
+
+The GitHub Actions workflows are driven entirely by repository-level (and environment-level) variables. None of the values below are hardcoded in the workflow YAML files.
+
+### Workflow feature flags
+
+<Note>
+  `WORKFLOW_INFRASTRUCTURE_ENABLED` and `WORKFLOW_SCHEDULER_ENABLED` act as feature flags. Both jobs check these values at the very start — the entire workflow is skipped unless the value is the string `'true'`. Set them to `'false'` to pause deployments without removing the workflow file.
+</Note>
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `WORKFLOW_INFRASTRUCTURE_ENABLED` | `'true'` \| `'false'` | Enables or disables the infrastructure deploy workflow |
+| `WORKFLOW_SCHEDULER_ENABLED` | `'true'` \| `'false'` | Enables or disables the scheduler deploy workflow |
+
+### Application
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `APP_NAME` | `gsmapplication` | Application name prefix used in every CloudFormation resource name |
+
+### Budget and alerting
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `BUDGET_LIMIT` | `30` | Monthly USD spend limit; triggers an SNS alert at 100% |
+| `ALERT_EMAIL` | `ops@example.com` | Email address that receives budget overage notifications |
+
+### CloudFront / EC2 authentication
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `CLOUDFRONT_HEADER` | `my-secret-header-value` | Custom `X-CloudFront-Origin` header value sent by CloudFront to the EC2 origin; the backend validates this to reject direct traffic |
+
+### ECS task sizing
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `TASK_NUMBER_DESIRED` | `1` | Desired number of running ECS tasks per service; set to `0` to pause all services |
+| `TASK_MEMORY` | `512` | Hard memory limit per ECS container (MB) |
+| `TASK_MEMORY_RESERVATION` | `384` | Soft memory reservation per ECS container (MB) |
+
+### Database connectivity
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `PORT_DB` | `1433` | TCP port for the SQL Server database |
+| `DB_MASTER_URL_PARAM` | `dev/backend/DB_MASTER_URL` | SSM parameter path for the DB connection URL |
+| `DB_MASTER_IP` | `10.0.0.5/32` | CIDR block of the database provider, used in the EC2 security group egress rule |
+
+### JWT
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `JWT_SECRET_PARAM` | `dev/backend/JWT_SECRET` | SSM parameter path for the JWT signing secret |
+
+### Networking
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `VPC_ID` | `vpc-0abc123def` | ID of the existing VPC |
+| `VPC_ID_CIDR_BLOCK` | `10.0.0.0/16` | CIDR block of the VPC; used in security group ingress rules |
+| `PRIVATE_SUBNET_ID_1` | `subnet-0abc123def` | ID of the private subnet for the EC2 instance |
+
+### EC2
+
+| Variable | Example | Description |
+|----------|---------|-------------|
+| `KEYPEM_EC2_NAME` | `dev-key-ec2` | Name of the existing EC2 key pair |
+| `EC2_INSTANCE_TYPE` | `t4g.medium` | EC2 instance type (must be ARM64-compatible — the AMI is `amazon-linux-2023/arm64`) |
+| `DNS_EC2_ELASTIC_IP` | `52.1.2.3` | DNS name or IP of an existing Elastic IP to attach; leave empty to allocate a new EIP automatically |
+
+## GitHub repository secrets
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_INFRA_ROLE_ARN` | ARN of the `InfraExecutorRole` created by the base stack. Both workflows use this ARN to assume the role via GitHub OIDC — no long-lived AWS credentials are stored. |
+
+Retrieve the ARN from the `InfraRoleArn` output of the base CloudFormation stack and add it as a repository secret under **Settings → Secrets and variables → Actions → Secrets**.
+
+## GitHub environments
+
+The workflows use the GitHub environment named `infra-{env}` to scope secrets, protection rules, and variable overrides per environment.
+
+Create the following three environments in **GitHub Settings → Environments** before the first workflow run:
+
+| Environment name | Maps to AWS environment |
+|-----------------|------------------------|
+| `infra-dev` | `dev` (deployed from `develop` branch) |
+| `infra-qa` | `qa` (deployed from `quality` branch) |
+| `infra-prod` | `prod` (deployed from `main` branch) |
+
+Each environment can carry its own copy of `AWS_INFRA_ROLE_ARN` and any variable overrides (for example, a higher `BUDGET_LIMIT` for production). Protection rules such as required reviewers are strongly recommended for `infra-prod`.

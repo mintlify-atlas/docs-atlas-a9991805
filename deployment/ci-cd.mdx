@@ -1,0 +1,145 @@
+---
+title: "CI/CD Workflows: Branch-Driven CloudFormation Deployments"
+sidebarTitle: "CI/CD"
+description: "GitHub Actions workflows for GSM Infrastructure automatically deploy CloudFormation stacks on push to develop, quality, and main — with OIDC keyless AWS authentication."
+---
+
+GSM Infrastructure uses two GitHub Actions workflows — `deploy-infrastructure.yml` and `deploy-scheduler.yml` — to deploy CloudFormation stacks automatically whenever the corresponding template files change on a tracked branch. Each branch maps to a fixed AWS environment (`dev`, `qa`, or `prod`), so merging a pull request from `develop` into `quality` or `quality` into `main` triggers the correct environment deploy without any manual configuration. Authentication to AWS is handled through OpenID Connect (OIDC), meaning no static AWS access keys are stored in GitHub Secrets.
+
+---
+
+## Branch-to-environment mapping
+
+| Branch | Environment | Stack name pattern |
+|--------|-------------|---------------------|
+| `develop` | `dev` | `dev-{appName}-*-stack` |
+| `quality` | `qa` | `qa-{appName}-*-stack` |
+| `main` | `prod` | `prod-{appName}-*-stack` |
+
+The stack name is assembled at runtime from the resolved environment and the `APP_NAME` GitHub Actions variable, for example `dev-gsmapplication-infrastructure-stack`.
+
+---
+
+## deploy-infrastructure.yml
+
+The infrastructure workflow deploys `devops/infrastructure/template.yml` to provision the S3, CloudFront, ECR, ECS, EC2, IAM, SNS, and AWS Budget resources described in the [infrastructure stack guide](/deployment/infrastructure-stack).
+
+**Triggers:**
+- **Push** to `develop`, `quality`, or `main` when `devops/infrastructure/template.yml` has changed.
+- **`workflow_dispatch`** with an `environment` input (`dev` / `qa` / `prod`) for on-demand deploys.
+
+**Jobs:**
+
+<Tabs>
+  <Tab title="determine-env">
+    Runs first. Reads `github.ref_name` (branch name) and maps it to the target environment string, or uses the `workflow_dispatch` input if the trigger was manual. The resolved environment is passed as a job output to the `deploy` job.
+
+    ```yaml
+    determine-env:
+      if: ${{ vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true' }}
+      name: Determine Environment
+      runs-on: ubuntu-latest
+      outputs:
+        environment: ${{ steps.set-env.outputs.environment }}
+    ```
+  </Tab>
+  <Tab title="deploy">
+    Depends on `determine-env`. Uses the GitHub Actions environment `infra-{env}` (e.g. `infra-dev`), which is where environment-scoped secrets and variables live. Requires `id-token: write` for OIDC token issuance and `contents: read` for checkout.
+
+    The CloudFormation deploy step uses `aws-actions/aws-cloudformation-github-deploy@v1.2.0` with:
+    - `capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM` — required because the template creates named IAM roles.
+    - `no-fail-on-empty-changeset: "1"` — a re-run with no template changes exits successfully.
+    - All CloudFormation parameters sourced from GitHub Actions variables (e.g. `vars.APP_NAME`, `vars.VPC_ID`).
+
+    ```yaml
+    deploy:
+      if: ${{ vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true' }}
+      name: Deploy Infrastructure
+      needs: determine-env
+      runs-on: ubuntu-latest
+      environment: infra-${{ needs.determine-env.outputs.environment }}
+      permissions:
+        id-token: write
+        contents: read
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## deploy-scheduler.yml
+
+The scheduler workflow deploys `devops/scheduler/template.yml` to provision the EventBridge Scheduler rules and Lambda functions described in the [scheduler stack guide](/deployment/scheduler-stack). Its structure is identical to the infrastructure workflow but is independently controlled by the `WORKFLOW_SCHEDULER_ENABLED` variable.
+
+**Triggers:**
+- **Push** to `develop`, `quality`, or `main` when `devops/scheduler/template.yml` has changed.
+- **`workflow_dispatch`** with an `environment` input.
+
+**Jobs:** Same two-job pattern (`determine-env` → `deploy`) as the infrastructure workflow. The CloudFormation stack name follows the pattern `{env}-{appName}-scheduler-stack`. All scheduler-specific parameters (`EC2InstanceId`, `EIPAllocationId`, `ECSClusterName`, service names, cron expressions) are sourced from GitHub Actions variables.
+
+---
+
+## OIDC authentication flow
+
+Neither workflow stores a static `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. Instead, they use the `aws-actions/configure-aws-credentials@v4` action with an `id-token: write` permission to obtain short-lived credentials via AWS STS:
+
+1. GitHub generates a signed OIDC token for the workflow run.
+2. `configure-aws-credentials` presents the token to the AWS STS `AssumeRoleWithWebIdentity` API.
+3. AWS validates the token against the OIDC provider configured in your account and returns temporary credentials scoped to `AWS_INFRA_ROLE_ARN`.
+4. Subsequent steps in the job use those credentials transparently — no secrets are exposed in logs.
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: ${{ secrets.AWS_INFRA_ROLE_ARN }}
+    aws-region: ${{ env.AWS_REGION }}
+```
+
+The `AWS_INFRA_ROLE_ARN` secret must be set on each GitHub Actions environment (`infra-dev`, `infra-qa`, `infra-prod`) and must reference an IAM role whose trust policy allows `sts:AssumeRoleWithWebIdentity` from the GitHub OIDC provider (`token.actions.githubusercontent.com`) for your repository.
+
+---
+
+## Manual dispatch
+
+Both workflows expose a `workflow_dispatch` trigger, allowing you to deploy to any environment outside of a branch push — useful for first-time setup, rollbacks, or deploying infrastructure changes before the template file is merged to a tracked branch.
+
+The full trigger block used in both workflows:
+
+```yaml
+on:
+  push:
+    branches: ["develop", "quality", "main"]
+    paths:
+      - "devops/infrastructure/template.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (dev/qa/prod)'
+        default: 'dev'
+```
+
+To trigger manually from the GitHub UI: navigate to **Actions → Deploy Infrastructure (or Deploy Scheduler) → Run workflow**, select the target branch, choose the environment, and click **Run workflow**.
+
+---
+
+## Enabling and disabling workflows
+
+Both workflows are gated behind GitHub Actions **repository variables** that act as feature flags. Neither workflow will run — even on a matching push — if the flag is not set to `true`.
+
+| Variable | Workflow | Effect |
+|----------|----------|--------|
+| `WORKFLOW_INFRASTRUCTURE_ENABLED` | `deploy-infrastructure.yml` | Set to `true` to enable automatic infrastructure deploys. Any other value (or absent) skips both jobs. |
+| `WORKFLOW_SCHEDULER_ENABLED` | `deploy-scheduler.yml` | Set to `true` to enable automatic scheduler deploys. |
+
+These variables are evaluated in the `if` condition of **both** the `determine-env` and `deploy` jobs:
+
+```yaml
+if: ${{ vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true' }}
+```
+
+Set or update these variables under **Settings → Secrets and variables → Actions → Variables** in your GitHub repository. Because the workflows use GitHub Actions environments (`infra-dev`, `infra-qa`, `infra-prod`), you can set the variables at the environment level to enable deployments only for specific environments.
+
+<Note>
+  `no-fail-on-empty-changeset: "1"` is set in both workflows. If you push a change unrelated to the CloudFormation templates — such as a README update — and the path filter still causes the workflow to run, CloudFormation will detect no changes in the stack and the job will exit successfully rather than failing with a `No updates are to be performed` error.
+</Note>

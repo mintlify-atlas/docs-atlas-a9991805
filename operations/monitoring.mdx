@@ -1,0 +1,136 @@
+---
+title: "Monitoring GSM Infrastructure with CloudWatch and AWS Budgets"
+sidebarTitle: "Monitoring"
+description: "Monitor GSM Infrastructure health using CloudWatch log groups, ECS service health checks, EC2 instance status, and AWS Budget cost alerts."
+---
+
+GSM Infrastructure exposes several monitoring surfaces out of the box: CloudWatch Log Groups collect structured output from all ECS containers and scheduler Lambda functions, ECS service health checks continuously validate each backend endpoint, a deployment circuit breaker automatically rolls back failed deploys, and an AWS Budget alert notifies you by email when monthly spend crosses your configured threshold. Together these mechanisms give you end-to-end visibility into both application health and infrastructure cost without requiring any additional tooling.
+
+## CloudWatch Log Groups
+
+Three log groups are created by the CloudFormation stacks. Retention policies are set at the stack level to control storage costs.
+
+<CardGroup cols={1}>
+  <Card title="/ecs/{env}-{appName}-backend" icon="server">
+    **Retention: 7 days** — Aggregated logs for all four ECS services running on the EC2 instance. Each container writes to this shared group using a unique stream prefix so you can filter by service:
+
+    | Stream prefix | Service |
+    |---|---|
+    | `gmsgateway` | API Gateway container (port 80) |
+    | `gmsauth` | Authentication service (port 8081) |
+    | `gsmapplication` | Application service (port 8082) |
+    | `gsmoperations` | Operations service (port 8083) |
+
+    Filter example in CloudWatch Logs Insights:
+
+    ```
+    fields @timestamp, @message
+    | filter @logStream like /gmsauth/
+    | sort @timestamp desc
+    | limit 50
+    ```
+  </Card>
+  <Card title="/aws/lambda/{env}-{appName}-ec2-stop" icon="circle-stop">
+    **Retention: 14 days** — Execution logs for the Stop Lambda. Each invocation logs ECS scale-down confirmations, EIP disassociation status, and the EC2 stop command result. Check this group whenever you suspect the nightly stop did not complete successfully.
+  </Card>
+  <Card title="/aws/lambda/{env}-{appName}-ec2-start" icon="circle-play">
+    **Retention: 14 days** — Execution logs for the Start Lambda. Each invocation logs EC2 start progress (including the `instance_running` waiter), EIP reassociation, and ECS scale-up confirmations.
+  </Card>
+</CardGroup>
+
+<Tip>
+Set up a CloudWatch alarm on the ECS service `RunningTaskCount` metric for each service. Configure the alarm to enter `ALARM` state when `RunningTaskCount < 1` during expected business hours (accounting for the scheduler window). Route the alarm to the existing SNS topic (`{env}-{appName}-notification-alerts`) so you are notified the moment a task unexpectedly drops to zero.
+</Tip>
+
+## ECS Service Health Checks
+
+Each container in the ECS task definitions includes a Docker-level health check that polls the service's own health endpoint. ECS uses this check to determine whether a task is healthy before routing traffic to it and before marking a deployment as successful.
+
+All four services share the same timing parameters:
+
+| Parameter | Value |
+|---|---|
+| `Interval` | 30 seconds |
+| `Timeout` | 10 seconds |
+| `Retries` | 3 |
+| `StartPeriod` | 120 seconds |
+
+The `StartPeriod` gives each container **120 seconds** to initialize before health check failures begin counting against the retry limit. This accommodates JVM warm-up or database connection pool initialization.
+
+| Service | Health check command |
+|---|---|
+| `gsmgateway` | `wget -qO- http://localhost:80/api/health \|\| exit 1` |
+| `gmsauth` | `wget -qO- http://localhost:8081/health \|\| exit 1` |
+| `gsmapplication` | `wget -qO- http://localhost:8082/health \|\| exit 1` |
+| `gsmoperations` | `wget -qO- http://localhost:8083/health \|\| exit 1` |
+
+<Info>
+The `HealthCheckGracePeriodSeconds: 60` setting on each ECS service gives the container an additional 60-second grace period **at the service level** (separate from the container-level `StartPeriod`) before ECS considers health check results when deciding whether to replace tasks. This prevents premature task replacement during deployment rollouts.
+</Info>
+
+## ECS Deployment Circuit Breaker
+
+All four ECS services enable the deployment circuit breaker with automatic rollback:
+
+```yaml
+DeploymentConfiguration:
+  MaximumPercent: 100
+  MinimumHealthyPercent: 0
+  DeploymentCircuitBreaker:
+    Enable: true
+    Rollback: true
+```
+
+If a new task revision fails its health checks during a deployment, ECS automatically rolls back to the previously running task definition revision. You will see a `SERVICE_DEPLOYMENT_FAILED` event in the ECS service event stream, and the service will return to the last known healthy state without manual intervention.
+
+<Steps>
+  <Step title="Check the ECS service events">
+    In the AWS Console, navigate to **ECS → Clusters → {cluster} → Services → {service} → Events** tab to see a timestamped list of deployment and health check events.
+  </Step>
+  <Step title="Inspect the failed task logs">
+    Go to **CloudWatch → Log groups → /ecs/{env}-{appName}-backend** and filter by the stream prefix for the affected service. Look for startup errors or connection failures during the deployment window.
+  </Step>
+  <Step title="Fix the issue and redeploy">
+    Push a corrected image to ECR and re-trigger the deployment workflow, or manually force a new deployment from the ECS Console.
+  </Step>
+</Steps>
+
+## AWS Budget Alerts
+
+A monthly **COST** budget is provisioned by the infrastructure stack and sends an SNS email alert when actual spend crosses 100% of the `BudgetLimitUSD` threshold (default: **$30 USD**).
+
+| Budget attribute | Value |
+|---|---|
+| Budget name | `{env}-{appName}-monthly-budget` |
+| Type | COST |
+| Period | MONTHLY |
+| Notification type | ACTUAL |
+| Alert threshold | 100% of `BudgetLimitUSD` |
+| Notification channel | SNS email (`{env}-{appName}-notification-alerts`) |
+
+See [Cost Management](/operations/cost-management) for detailed configuration guidance and cost optimization tips.
+
+## EC2 Instance Monitoring
+
+The EC2 instance is enrolled in **AWS Systems Manager (SSM)** via the `AmazonSSMManagedInstanceCore` managed policy attached to its IAM instance role. This enables:
+
+- **Session Manager** — open an interactive shell session to the instance from the AWS Console or CLI without opening SSH port 22 or managing key pairs for day-to-day access.
+- **SSM Parameter Store access** — the instance role also includes a scoped `SSMParameterStoreRead` inline policy that allows `ssm:GetParameter*` and `kms:Decrypt` for the `/{env}/*` parameter path.
+
+**Open a Session Manager session (CLI):**
+
+```bash
+aws ssm start-session --target i-0abc123def456789
+```
+
+**Check ECS agent status on the instance:**
+
+```bash
+# Inside the Session Manager shell
+sudo systemctl status ecs
+sudo docker ps
+```
+
+<Note>
+The EC2 instance lives in a **private subnet** with no inbound SSH rule in the security group. Session Manager is the recommended way to access the instance for debugging. If you need to use the EC2 key pair (stored as `Ec2PenKeyName`) for emergency access, you will need a bastion host or AWS EC2 Instance Connect Endpoint in the same VPC.
+</Note>

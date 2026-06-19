@@ -1,0 +1,104 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "GSM Infrastructure",
+  "projectDescription": "AWS CloudFormation infrastructure-as-code for a multi-service GSM application platform, including ECS-on-EC2 backend microservices, CloudFront+S3 frontend, ECR, cost scheduling, and GitHub Actions OIDC-based CI/CD deployment.",
+  "theme": "aspen",
+  "primaryColor": "#FF9900",
+  "lightColor": "#FFB84D",
+  "darkColor": "#CC7A00",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "introduction",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Getting Started",
+            "pages": [
+              "getting-started/prerequisites",
+              "getting-started/base-setup",
+              "getting-started/configuration"
+            ]
+          },
+          {
+            "group": "Deployment",
+            "pages": [
+              "deployment/infrastructure-stack",
+              "deployment/scheduler-stack",
+              "deployment/ci-cd"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/cost-management",
+              "operations/scheduler",
+              "operations/monitoring",
+              "operations/security"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "CloudFormation Stacks",
+            "pages": [
+              "reference/base-template",
+              "reference/infrastructure-template",
+              "reference/scheduler-template"
+            ]
+          },
+          {
+            "group": "GitHub Actions Workflows",
+            "pages": [
+              "reference/workflow-infrastructure",
+              "reference/workflow-scheduler"
+            ]
+          },
+          {
+            "group": "AWS Services",
+            "pages": [
+              "reference/ecs-services",
+              "reference/networking"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Three-environment support (dev / qa / prod) via branch-driven GitHub Actions workflows",
+    "ECS-on-EC2 cluster running four microservices: Gateway, Auth, Application, and Operations",
+    "CloudFront + S3 frontend with SPA router CloudFront Function and Origin Access Control",
+    "GitHub OIDC-based keyless authentication — no long-lived AWS credentials in CI/CD",
+    "Cost scheduler using EventBridge Scheduler + Lambda to start/stop EC2 and scale ECS on a weekday schedule",
+    "AWS Budgets + SNS email alerts for monthly spend threshold",
+    "SSM Parameter Store for secrets (JWT, DB connection string) — no plaintext credentials",
+    "ECR repository with image scanning on push",
+    "IAM least-privilege roles scoped by environment prefix"
+  ],
+  "publicApiSurface": [
+    "devops/base/template.yml — GitHub OIDC provider + InfraExecutorRole CloudFormation stack",
+    "devops/infrastructure/template.yml — Main infrastructure stack (S3, CloudFront, ECS cluster, EC2, ECR, Budget, SNS)",
+    "devops/scheduler/template.yml — EventBridge Scheduler + Lambda start/stop stack",
+    ".github/workflows/deploy-infrastructure.yml — CI/CD workflow for the infrastructure stack",
+    ".github/workflows/deploy-scheduler.yml — CI/CD workflow for the scheduler stack",
+    "CloudFormation Parameter: Environment (dev|qa|prod)",
+    "CloudFormation Parameter: AppName",
+    "CloudFormation Parameter: VpcId / PrivateSubnet1Id",
+    "CloudFormation Parameter: BudgetLimitUSD / AlertEmail",
+    "CloudFormation Parameter: SchedulerStartExpression / SchedulerStopExpression",
+    "CloudFormation Parameter: TaskNumberDesired / TaskMemory / TaskMemoryReservation",
+    "Lambda StopFunction — scales ECS to 0, disassociates EIP, stops EC2",
+    "Lambda StartFunction — starts EC2, reassociates EIP, scales ECS to 1",
+    "ECS Services: GatewayService (port 80), AuthService (port 8081), ApplicationService (port 8082), OperationsService (port 8083)"
+  ]
+}

@@ -1,0 +1,177 @@
+---
+title: "Base Template Reference: OIDC Provider and IAM Executor Role"
+sidebarTitle: "Base Template"
+description: "Complete parameter, resource, and output reference for devops/base/template.yml — the GitHub OIDC provider and InfraExecutorRole CloudFormation stack."
+---
+
+The base template (`devops/base/template.yml`) is the foundational CloudFormation stack for the GSM Infrastructure platform. It establishes the GitHub Actions OIDC trust relationship and provisions the `InfraExecutorRole` IAM role together with the three IAM policies that give it the permissions it needs to deploy and manage all other stacks. Deploy this stack once per AWS account before deploying any other GSM stacks.
+
+## Parameters
+
+<ParamField path="Environment" type="String" default="dev">
+  The deployment environment. Controls naming prefixes and resource scoping across all created resources.
+
+  **Allowed values:** `dev`, `qa`, `prod`
+</ParamField>
+
+<ParamField path="AppName" type="String" default="GSMApplication">
+  The application name used as part of all resource name patterns (e.g. `dev-GSMApplication-infrastructure-role`).
+</ParamField>
+
+<ParamField path="GitHubOrg" type="String" required>
+  The GitHub organization or username that owns the repository (e.g. `ti-infinite`). Used to scope the OIDC trust condition so only workflows from this org can assume the role.
+</ParamField>
+
+<ParamField path="GitHubRepo" type="String" required>
+  The GitHub repository name (e.g. `GSMInfrastructure`). Combined with `GitHubOrg` to build the `sub` claim condition. Use `*` to allow any repository in the organization.
+</ParamField>
+
+<ParamField path="GitHubBranch" type="String" default="main">
+  The branch whose workflows are authorized to assume the role (e.g. `main`). Use `*` to allow any branch. The trust also automatically permits deployments triggered from environments named `infra-*`, `backend-*`, and `frontend-*`.
+</ParamField>
+
+<ParamField path="CreateOIDCProvider" type="String" default="true">
+  Whether to create the GitHub Actions OIDC provider (`AWS::IAM::OIDCProvider`) in this account. Set to `false` if an OIDC provider for `token.actions.githubusercontent.com` already exists — AWS allows only one per account.
+
+  **Allowed values:** `true`, `false`
+</ParamField>
+
+## Resources
+
+### GitHubOIDCProvider
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::OIDCProvider` |
+| **Condition** | `ShouldCreateOIDCProvider` — only created when `CreateOIDCProvider=true` |
+| **URL** | `https://token.actions.githubusercontent.com` |
+| **Client ID** | `sts.amazonaws.com` |
+
+Registers GitHub Actions as a trusted identity provider in IAM so that GitHub workflow jobs can exchange short-lived OIDC tokens for temporary AWS credentials without storing long-lived access keys.
+
+**Thumbprints** pinned in the template:
+
+| Thumbprint |
+|---|
+| `6938fd4d98bab03faadb97b34396831e3780aea1` |
+| `1c58a3a8518e8759bf075b76b750d4f2df264fcd` |
+
+---
+
+### InfraExecutorRole
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Role` |
+| **Name pattern** | `{Environment}-{AppName}-infrastructure-role` |
+
+The central execution identity for all GSM CloudFormation deployments. It carries two trust policy statements:
+
+**1 — AWS service principals** (for CloudFormation to pass the role to managed services):
+
+- `cloudformation.amazonaws.com`
+- `ecs-tasks.amazonaws.com`
+- `s3.amazonaws.com`
+- `kms.amazonaws.com`
+- `cloudfront.amazonaws.com`
+
+**2 — GitHub OIDC federated trust** (for GitHub Actions workflows):
+
+- Principal: the `GitHubOIDCProvider` ARN (or the pre-existing provider ARN when `CreateOIDCProvider=false`)
+- Action: `sts:AssumeRoleWithWebIdentity`
+- Conditions:
+  - `StringEquals` — `token.actions.githubusercontent.com:aud` must equal `sts.amazonaws.com`
+  - `StringLike` — `token.actions.githubusercontent.com:sub` must match one of:
+    - `repo:{GitHubOrg}/{GitHubRepo}:ref:refs/heads/{GitHubBranch}`
+    - `repo:{GitHubOrg}/{GitHubRepo}:environment:infra-*`
+    - `repo:{GitHubOrg}/{GitHubRepo}:environment:backend-*`
+    - `repo:{GitHubOrg}/{GitHubRepo}:environment:frontend-*`
+
+---
+
+### ParametersResourcesPolicy
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Policy` |
+| **Name pattern** | `{Environment}-{AppName}-parameters-resources-policy` |
+| **Attached to** | `InfraExecutorRole` |
+
+Grants the executor role permissions to manage configuration, secrets, and stack-level resources. Permissions are scoped to the `{Environment}-*` name prefix wherever possible.
+
+| Service | Actions |
+|---|---|
+| **SNS** | `CreateTopic`, `DeleteTopic`, `Subscribe`, `GetTopicAttributes`, `SetTopicAttributes`, `TagResource` |
+| **Budgets** | `CreateBudgetAction`, `DeleteBudgetAction`, `UpdateBudgetAction`, `DescribeBudgetAction`, `ModifyBudget`, `TagResource`, `UntagResource` |
+| **SSM** | `GetParameter`, `GetParameters` (env params + AWS service catalog params); `StartSession`, `TerminateSession`, `ResumeSession`, `DescribeSessions`, `GetConnectionStatus` (all resources) |
+| **KMS** | `Encrypt`, `Decrypt` |
+| **IAM** | Full lifecycle management of roles, policies, and instance profiles scoped to `{Environment}-*` |
+| **CloudFormation** | Full stack lifecycle (create, update, delete, change sets, rollback) scoped to `{Environment}-*` stacks |
+| **EventBridge** | `PutRule`, `DeleteRule`, `DescribeRule`, `PutTargets`, `RemoveTargets`, `ListTargetsByRule`, `TagResource`, `UntagResource` |
+
+---
+
+### RuntimeResourcesPolicy
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Policy` |
+| **Name pattern** | `{Environment}-{AppName}-runtime-resources-policy` |
+| **Attached to** | `InfraExecutorRole` |
+
+Grants permissions to manage compute and observability resources.
+
+| Service | Actions |
+|---|---|
+| **ECS** | Cluster, service, and task definition lifecycle scoped to `{Environment}-*`; `DeregisterTaskDefinition` and `DescribeTaskDefinition` on all resources |
+| **CloudWatch Logs** | `CreateLogGroup`, `DeleteLogGroup`, `PutRetentionPolicy`, `DeleteRetentionPolicy`, `DescribeLogGroups`, `TagResource` scoped to `/{Environment}-*` log groups |
+| **ELB** | Create/delete/describe load balancers, target groups, and listeners for `net/{Environment}-*` load balancers |
+| **Lambda** | Full function lifecycle (create, update, delete, publish, alias, permissions) scoped to `{Environment}-*` functions |
+| **GuardDuty** | `CreateDetector`, `DeleteDetector`, `GetDetector`, `UpdateDetector`, `ListDetectors`, `TagResource`, `UntagResource` |
+
+---
+
+### StaticResourcesPolicy
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Policy` |
+| **Name pattern** | `{Environment}-{AppName}-static-resources-policy` |
+| **Attached to** | `InfraExecutorRole` |
+
+Grants permissions to manage static hosting, container images, networking, and scheduling resources.
+
+| Service | Actions |
+|---|---|
+| **S3** | Bucket and object lifecycle scoped to `{Environment}-*-frontend` buckets |
+| **CloudFront** | Distribution, OAC, and Function lifecycle; `CreateInvalidation` |
+| **EC2** | Security groups, instance run/stop/start/terminate, address association/disassociation, tagging; describe actions on all resources |
+| **ECR** | Repository lifecycle, image push/pull/delete, scanning configuration scoped to `{Environment}-*` repositories; `GetAuthorizationToken` on all resources |
+| **Scheduler** | Full EventBridge Scheduler lifecycle (schedules and schedule groups) on all resources |
+| **Service Discovery** | Namespace and service lifecycle on all resources |
+| **Route 53** | Hosted zone creation, record set management, change tracking on all resources |
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `InfraRoleArn` | Full ARN of the `InfraExecutorRole`. Use this as the `role-to-assume` value in GitHub Actions OIDC workflows. |
+| `InfraRoleName` | Logical name of the `InfraExecutorRole` (e.g. `dev-GSMApplication-infrastructure-role`). |
+| `OIDCProviderArn` | ARN of the created `GitHubOIDCProvider`. **Conditional** — only present in the stack outputs when `CreateOIDCProvider=true`. |
+
+## Example deploy command
+
+```bash
+aws cloudformation deploy \
+  --template-file devops/base/template.yml \
+  --stack-name prod-gsmapplication-base-stack \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+    Environment=prod \
+    AppName=gsmapplication \
+    GitHubOrg=ti-infinite \
+    GitHubRepo=GSMInfrastructure \
+    GitHubBranch=main \
+    CreateOIDCProvider=true
+```

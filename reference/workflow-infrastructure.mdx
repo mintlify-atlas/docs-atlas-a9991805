@@ -1,0 +1,255 @@
+---
+title: "deploy-infrastructure.yml: Infrastructure Deployment Workflow"
+sidebarTitle: "Infrastructure Workflow"
+description: "Reference for the deploy-infrastructure.yml GitHub Actions workflow that deploys the GSM CloudFormation infrastructure stack with OIDC authentication."
+---
+
+The `deploy-infrastructure.yml` workflow automates the deployment of the GSM CloudFormation infrastructure stack. It uses GitHub's OIDC integration to assume an AWS IAM role without storing long-lived credentials, then invokes `aws-actions/aws-cloudformation-github-deploy` to create or update the stack. The workflow provisions all core resources — ECS cluster, EC2 instance, ECR repository, S3 frontend bucket, CloudFront distribution, security groups, and an AWS Budget — across the `dev`, `qa`, and `prod` environments.
+
+## Triggers
+
+The workflow fires on two events:
+
+- **Push** to the `develop`, `quality`, or `main` branches, but **only** when `devops/infrastructure/template.yml` is part of the commit (path filter). This prevents unrelated commits from triggering an unnecessary stack update.
+- **`workflow_dispatch`** — allows manual runs from the GitHub Actions UI with an explicit `environment` input.
+
+| Trigger | Branch / Path | Resolved environment |
+|---|---|---|
+| Push | `develop` / `devops/infrastructure/template.yml` | `dev` |
+| Push | `quality` / `devops/infrastructure/template.yml` | `qa` |
+| Push | `main` / `devops/infrastructure/template.yml` | `prod` |
+| `workflow_dispatch` | Any | Value chosen in the input (default: `dev`) |
+
+## Environment Variable
+
+A single workflow-level environment variable is set for all jobs:
+
+| Variable | Value |
+|---|---|
+| `AWS_REGION` | `us-east-1` |
+
+## Jobs
+
+The workflow contains two jobs that run sequentially.
+
+### `determine-env`
+
+<Note>
+  This job (and the `deploy` job) only runs when the repository variable `vars.WORKFLOW_INFRASTRUCTURE_ENABLED` equals `'true'`. Set this variable to `'false'` to disable all infrastructure deployments without removing the workflow file.
+</Note>
+
+- **Condition:** `vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true'`
+- **Runner:** `ubuntu-latest`
+- **Purpose:** Resolves the target environment string (`dev`, `qa`, or `prod`) and exposes it as the `environment` output for the `deploy` job.
+- **Logic:** When triggered by `workflow_dispatch`, the environment is taken directly from `github.event.inputs.environment`. For push events, the branch name is mapped: `main` → `prod`, `quality` → `qa`, `develop` → `dev` (any other branch falls back to `dev`).
+
+**Outputs:**
+
+| Output key | Description |
+|---|---|
+| `environment` | Resolved environment string used by the `deploy` job |
+
+### `deploy`
+
+- **Condition:** `vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true'`
+- **Needs:** `determine-env`
+- **Runner:** `ubuntu-latest`
+- **GitHub Environment:** `infra-{env}` (e.g. `infra-dev`, `infra-qa`, `infra-prod`)
+- **Permissions:**
+
+| Permission | Level | Reason |
+|---|---|---|
+| `id-token` | `write` | Required to request the OIDC JWT for AWS role assumption |
+| `contents` | `read` | Required to check out the repository |
+
+## Deploy Job Steps
+
+<Accordion title="Step 1 — Checkout code">
+  ```yaml
+  - name: Checkout code
+    uses: actions/checkout@v4
+  ```
+  Checks out the repository at the commit that triggered the workflow so the CloudFormation template is available on the runner.
+</Accordion>
+
+<Accordion title="Step 2 — Configure AWS credentials">
+  ```yaml
+  - name: Configure AWS credentials
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: ${{ secrets.AWS_INFRA_ROLE_ARN }}
+      aws-region: ${{ env.AWS_REGION }}
+  ```
+  Exchanges the GitHub OIDC token for short-lived AWS credentials by assuming the role stored in `AWS_INFRA_ROLE_ARN`. No static access keys are stored in the repository.
+</Accordion>
+
+<Accordion title="Step 3 — Deploy CloudFormation Stack">
+  ```yaml
+  - name: Deploy CloudFormation Stack
+    uses: aws-actions/aws-cloudformation-github-deploy@v1.2.0
+    with:
+      name: "${{ needs.determine-env.outputs.environment }}-${{ vars.APP_NAME }}-infrastructure-stack"
+      template: devops/infrastructure/template.yml
+      capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+      region: ${{ env.AWS_REGION }}
+      no-fail-on-empty-changeset: "1"
+  ```
+  Creates or updates the CloudFormation stack. `CAPABILITY_IAM` and `CAPABILITY_NAMED_IAM` are required because the template creates named IAM roles and policies. When there are no changes, `no-fail-on-empty-changeset: "1"` prevents the step from failing.
+
+  **Stack name pattern:** `{env}-{appName}-infrastructure-stack`
+  (e.g. `dev-gsmapplication-infrastructure-stack`)
+</Accordion>
+
+## Parameter Overrides
+
+All CloudFormation parameters are injected via the `parameter-overrides` field and sourced from repository variables:
+
+| CloudFormation Parameter | Repository Variable | Description |
+|---|---|---|
+| `Environment` | `determine-env` output | Target environment (`dev` / `qa` / `prod`) |
+| `AppName` | `vars.APP_NAME` | Application name used in resource naming |
+| `BudgetLimitUSD` | `vars.BUDGET_LIMIT` | Monthly AWS cost budget ceiling in USD |
+| `AlertEmail` | `vars.ALERT_EMAIL` | Email address for budget alert notifications |
+| `CloudFrontHeader` | `vars.CLOUDFRONT_HEADER` | Custom header value for CloudFront → EC2 origin |
+| `TaskNumberDesired` | `vars.TASK_NUMBER_DESIRED` | ECS desired task count for all services |
+| `TaskMemory` | `vars.TASK_MEMORY` | Hard memory limit (MB) per ECS task |
+| `TaskMemoryReservation` | `vars.TASK_MEMORY_RESERVATION` | Soft memory reservation (MB) per ECS task |
+| `DBPortParameterName` | `vars.PORT_DB` | Database port number |
+| `DBMasterUrlParameterName` | `vars.DB_MASTER_URL_PARAM` | SSM parameter name for the DB connection string |
+| `SqlServerProviderIp` | `vars.DB_MASTER_IP` | CIDR block of the SQL Server provider |
+| `JWTSecretParameterName` | `vars.JWT_SECRET_PARAM` | SSM parameter name for the JWT signing secret |
+| `VpcId` | `vars.VPC_ID` | ID of the existing VPC |
+| `VpcIdCidrBlock` | `vars.VPC_ID_CIDR_BLOCK` | CIDR block of the existing VPC |
+| `PrivateSubnet1Id` | `vars.PRIVATE_SUBNET_ID_1` | ID of the private subnet for the EC2 instance |
+| `Ec2PenKeyName` | `vars.KEYPEM_EC2_NAME` | EC2 key pair name for SSH access |
+| `Ec2InstanceType` | `vars.EC2_INSTANCE_TYPE` | EC2 instance type (e.g. `t4g.medium`) |
+| `ExistingEIPPublicIp` | `vars.DNS_EC2_ELASTIC_IP` | DNS hostname of an existing Elastic IP |
+
+## Required Repository Variables
+
+Configure the following variables under **Settings → Secrets and variables → Actions → Variables** in the repository:
+
+| Variable | Description |
+|---|---|
+| `WORKFLOW_INFRASTRUCTURE_ENABLED` | Set to `'true'` to enable this workflow; any other value disables both jobs |
+| `APP_NAME` | Application name (e.g. `gsmapplication`); used in all resource name prefixes |
+| `BUDGET_LIMIT` | Monthly cost threshold in USD (e.g. `30`) |
+| `ALERT_EMAIL` | Email address to receive AWS Budget overage alerts |
+| `CLOUDFRONT_HEADER` | Secret header value that CloudFront sends to EC2 to block direct requests |
+| `TASK_NUMBER_DESIRED` | Number of running ECS tasks per service (use `0` to keep services stopped) |
+| `TASK_MEMORY` | Hard memory limit in MB per container (e.g. `512`) |
+| `TASK_MEMORY_RESERVATION` | Soft memory reservation in MB per container (e.g. `384`) |
+| `PORT_DB` | TCP port for the SQL Server database (e.g. `1433`) |
+| `DB_MASTER_URL_PARAM` | SSM Parameter Store path for the DB URL (e.g. `dev/backend/DB_MASTER_URL`) |
+| `DB_MASTER_IP` | CIDR block of the database host (e.g. `10.1.2.3/32`) |
+| `JWT_SECRET_PARAM` | SSM Parameter Store path for the JWT secret (e.g. `dev/backend/JWT_SECRET`) |
+| `VPC_ID` | AWS VPC ID (e.g. `vpc-0abc1234`) |
+| `VPC_ID_CIDR_BLOCK` | CIDR of the VPC (e.g. `10.0.0.0/16`) |
+| `PRIVATE_SUBNET_ID_1` | Subnet ID where the ECS EC2 instance is launched |
+| `KEYPEM_EC2_NAME` | Name of the EC2 key pair for SSH (e.g. `dev-key-ec2`) |
+| `EC2_INSTANCE_TYPE` | Instance type for the ECS host (e.g. `t4g.medium`) |
+| `DNS_EC2_ELASTIC_IP` | DNS hostname of the Elastic IP attached to the EC2 instance |
+
+## Required Secret
+
+| Secret | Description |
+|---|---|
+| `AWS_INFRA_ROLE_ARN` | ARN of the IAM role to assume via OIDC (output of `devops/base/template.yml`) |
+
+<Warning>
+  `AWS_INFRA_ROLE_ARN` must be stored as an **Actions secret** (not a variable) and scoped to the `infra-{env}` GitHub Environment so that only deployments targeting that environment can assume the role.
+</Warning>
+
+## Full Workflow YAML
+
+```yaml
+name: Deploy Infrastructure
+on:
+  push:
+    branches: ["develop", "quality", "main"]
+    paths:
+      - "devops/infrastructure/template.yml"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment (dev/qa/prod)'
+        default: 'dev'
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  determine-env:
+    if: ${{ vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true' }}
+    name: Determine Environment
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.set-env.outputs.environment }}
+    steps:
+      - name: Set Environment
+        id: set-env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+            if [ "$BRANCH" = "main" ]; then
+              ENV="prod"
+            elif [ "$BRANCH" = "quality" ]; then
+              ENV="qa"
+            elif [ "$BRANCH" = "develop" ]; then
+              ENV="dev"
+            else
+              ENV="dev"
+            fi
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "Deploying $ENV-infiniteherbs-infrastructure-stack"
+  
+  deploy:
+    if: ${{ vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true' }}
+    name: Deploy Infrastructure
+    needs: determine-env
+    runs-on: ubuntu-latest
+    environment: infra-${{ needs.determine-env.outputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_INFRA_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Deploy CloudFormation Stack
+        uses: aws-actions/aws-cloudformation-github-deploy@v1.2.0
+        with:
+          name: "${{ needs.determine-env.outputs.environment }}-${{ vars.APP_NAME }}-infrastructure-stack"
+          template: devops/infrastructure/template.yml
+          capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+          region: ${{ env.AWS_REGION }}
+          parameter-overrides: >-
+            Environment="${{ needs.determine-env.outputs.environment }}",
+            AppName="${{ vars.APP_NAME }}",
+            BudgetLimitUSD="${{ vars.BUDGET_LIMIT }}",
+            AlertEmail="${{ vars.ALERT_EMAIL }}",
+            CloudFrontHeader="${{ vars.CLOUDFRONT_HEADER }}",
+            TaskNumberDesired="${{ vars.TASK_NUMBER_DESIRED }}",
+            TaskMemory="${{ vars.TASK_MEMORY }}",
+            TaskMemoryReservation="${{ vars.TASK_MEMORY_RESERVATION }}",
+            DBPortParameterName="${{ vars.PORT_DB }}",
+            DBMasterUrlParameterName="${{ vars.DB_MASTER_URL_PARAM }}",
+            SqlServerProviderIp="${{ vars.DB_MASTER_IP }}",
+            JWTSecretParameterName="${{ vars.JWT_SECRET_PARAM }}",
+            VpcId="${{ vars.VPC_ID }}",
+            VpcIdCidrBlock="${{ vars.VPC_ID_CIDR_BLOCK }}",
+            PrivateSubnet1Id="${{ vars.PRIVATE_SUBNET_ID_1 }}",
+            Ec2PenKeyName="${{ vars.KEYPEM_EC2_NAME }}",
+            Ec2InstanceType="${{ vars.EC2_INSTANCE_TYPE }}",
+            ExistingEIPPublicIp="${{ vars.DNS_EC2_ELASTIC_IP}}"
+          no-fail-on-empty-changeset: "1"
+```

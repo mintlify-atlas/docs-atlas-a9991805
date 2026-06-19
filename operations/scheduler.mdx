@@ -1,0 +1,154 @@
+---
+title: "Operate the GSM Start/Stop Scheduler"
+sidebarTitle: "Scheduler"
+description: "Manage, monitor, and adjust the EventBridge Scheduler that automatically starts and stops the GSM Infrastructure EC2 instance and ECS services on a weekday schedule."
+---
+
+The GSM Infrastructure scheduler reduces costs by automatically shutting down the EC2 instance and all ECS services outside of business hours and bringing them back up in the morning. It is implemented as two AWS Lambda functions (Python 3.12, arm64) triggered by Amazon EventBridge Scheduler on a Mon–Sat cron schedule. The schedules are fully configurable via CloudFormation parameters and are deployed independently from the main infrastructure stack through the `deploy-scheduler.yml` GitHub Actions workflow.
+
+## Default Schedule
+
+Two EventBridge Schedules are provisioned inside a schedule group named `{env}-{appName}-ec2-schedules`. Both run in **UTC** with `FlexibleTimeWindow: OFF` (exact time, no jitter).
+
+| Schedule resource | CloudFormation parameter | Default expression | UTC time | COT (UTC−5) |
+|---|---|---|---|---|
+| `StopScheduleWeekdays` | `SchedulerStopExpression` | `cron(0 1 ? * MON-SAT *)` | 01:00 UTC | 8:00 PM previous day |
+| `StartScheduleWeekdays` | `SchedulerStartExpression` | `cron(0 9 ? * MON-SAT *)` | 09:00 UTC | 4:00 AM COT |
+
+<Note>
+All cron expressions are evaluated in UTC. Colombia Standard Time (COT) is UTC−5 and does **not** observe daylight saving time, so the UTC offset is constant year-round.
+</Note>
+
+### What each Lambda does
+
+**Stop Lambda** (`{env}-{appName}-ec2-stop`):
+1. Scales all four ECS services (`gateway`, `auth`, `application`, `operations`) to `desiredCount=0`.
+2. Waits 10 seconds for ECS to begin draining containers.
+3. Disassociates the Elastic IP (avoids idle EIP charges).
+4. Stops the EC2 instance.
+
+**Start Lambda** (`{env}-{appName}-ec2-start`):
+1. Starts the EC2 instance.
+2. Waits for the instance to reach the `running` state (polls every 10 s, up to 30 attempts).
+3. Reassociates the Elastic IP so the CloudFront origin address stays stable.
+4. Waits 30 seconds for the ECS agent to register with the cluster.
+5. Scales all four ECS services back to `desiredCount=1`.
+
+## Monitoring Lambda Executions
+
+Every Lambda invocation writes structured logs to dedicated CloudWatch Log Groups with **14-day retention**:
+
+| Log group | Lambda |
+|---|---|
+| `/aws/lambda/{env}-{appName}-ec2-stop` | Stop function |
+| `/aws/lambda/{env}-{appName}-ec2-start` | Start function |
+
+<Steps>
+  <Step title="Open CloudWatch Logs">
+    In the AWS Console, navigate to **CloudWatch → Log groups** and search for your environment prefix (e.g., `dev-gsmapplication`).
+  </Step>
+  <Step title="Select the log group">
+    Open `/aws/lambda/{env}-{appName}-ec2-stop` or `/aws/lambda/{env}-{appName}-ec2-start`.
+  </Step>
+  <Step title="Find the latest log stream">
+    Log streams are named by Lambda instance ID and timestamp. Select the most recent stream to see the execution output.
+  </Step>
+  <Step title="Inspect the log output">
+    Successful runs log lines like `ECS {service} → desiredCount=0` and `Instancia {id} detenida`. Errors appear as `ERROR` level entries with a Python traceback.
+  </Step>
+</Steps>
+
+## Changing the Schedule
+
+Update the `SchedulerStartExpression` and `SchedulerStopExpression` GitHub Actions variables for your environment, then push a change to `devops/scheduler/template.yml` (or trigger the workflow manually) to redeploy the scheduler stack.
+
+```yaml
+# Common example values
+
+# Start at 8:00 AM COT (13:00 UTC)
+SchedulerStartExpression: cron(0 13 ? * MON-SAT *)
+
+# Stop at 8:00 PM COT (01:00 UTC next calendar day)
+SchedulerStopExpression: cron(0 1 ? * MON-SAT *)
+```
+
+```yaml
+# Start at 7:00 AM COT (12:00 UTC)
+SchedulerStartExpression: cron(0 12 ? * MON-SAT *)
+
+# Stop at 9:00 PM COT (02:00 UTC next calendar day)
+SchedulerStopExpression: cron(0 2 ? * MON-SAT *)
+```
+
+<Tip>
+Use [crontab.guru](https://crontab.guru) to validate your cron expression before deploying. Remember that EventBridge uses the AWS cron syntax with a required `?` in the day-of-month or day-of-week field.
+</Tip>
+
+## Manual Override
+
+You can start or stop the EC2 instance at any time from the AWS Console or CLI without modifying the schedule. The scheduler will resume normal operation at the next scheduled run.
+
+**Start the instance manually (AWS CLI):**
+
+```bash
+aws ec2 start-instances --instance-ids i-0abc123def456789
+```
+
+**Stop the instance manually (AWS CLI):**
+
+```bash
+aws ec2 stop-instances --instance-ids i-0abc123def456789
+```
+
+**Scale ECS services manually:**
+
+```bash
+# Scale up (replace cluster/service names with your environment values)
+aws ecs update-service \
+  --cluster dev-gsmapplication-cluster \
+  --service dev-gsmapplication-gateway-service \
+  --desired-count 1
+```
+
+<Note>
+A manual start does **not** reassociate the Elastic IP automatically. If you start the instance manually after the stop Lambda has run, either wait for the start Lambda to fire at the next scheduled time, or reassociate the EIP manually via the Console (**EC2 → Elastic IPs → Associate**) or CLI (`aws ec2 associate-address`).
+</Note>
+
+## Retry Policy
+
+Both EventBridge Schedules are configured with the following retry policy on the Lambda target:
+
+```yaml
+RetryPolicy:
+  MaximumRetryAttempts: 2
+  MaximumEventAgeInSeconds: 3600
+```
+
+If the Lambda invocation fails (for example, due to a transient AWS API error), EventBridge will retry the invocation up to **2 additional times** within a **1-hour window**. After all retries are exhausted, the event is discarded — there is no dead-letter queue by default.
+
+<Warning>
+If the Stop Lambda fails (for example, because the ECS drain takes longer than the 120-second Lambda timeout), the EC2 instance may **not** be stopped and the EIP may remain associated. Always check CloudWatch Logs for the stop function after the scheduled stop time. If the instance is still running, either trigger the Lambda manually from the Console or stop the instance via the CLI.
+</Warning>
+
+## Disabling the Scheduler
+
+You have two options to disable automated scheduling:
+
+<Steps>
+  <Step title="Option A — Prevent future deploys (GitHub variable)">
+    Set the repository variable `WORKFLOW_SCHEDULER_ENABLED` to `false`. The `deploy-scheduler.yml` workflow guards both jobs with:
+
+    ```yaml
+    if: ${{ vars.WORKFLOW_SCHEDULER_ENABLED == 'true' }}
+    ```
+
+    With this flag set to `false`, pushes to `devops/scheduler/template.yml` will no longer trigger a deploy. Existing schedules in AWS remain active until you disable them directly.
+  </Step>
+  <Step title="Option B — Disable schedules in the AWS Console">
+    Navigate to **Amazon EventBridge → Scheduler → Schedule groups → {env}-{appName}-ec2-schedules**. Select each schedule (`stop-lun-sab` and `start-lun-sab`) and set **State** to **Disabled**. This takes effect immediately without any code change.
+  </Step>
+</Steps>
+
+<Note>
+Disabling the schedules does not delete the CloudFormation stack or the Lambda functions. You can re-enable the schedules at any time from the Console or by setting `State: DISABLED` → `ENABLED` in the template and redeploying.
+</Note>

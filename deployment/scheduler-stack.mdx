@@ -1,0 +1,164 @@
+---
+title: "Deploy the GSM Cost Scheduler CloudFormation Stack"
+sidebarTitle: "Scheduler Stack"
+description: "Deploy devops/scheduler/template.yml to provision EventBridge Scheduler rules and Lambda functions that automatically start and stop the EC2 instance on a weekday schedule."
+---
+
+The GSM scheduler stack reduces compute costs by running infrastructure only during business hours. It provisions two Python Lambda functions and a pair of EventBridge Scheduler rules that automatically stop the EC2 instance (and scale down ECS) each night, then restart everything each morning — Monday through Saturday. Because the EC2 instance is the sole compute host, turning it off outside working hours eliminates instance charges for roughly half of each calendar month without any manual intervention.
+
+<Warning>
+  Deploy the [infrastructure stack](/deployment/infrastructure-stack) first. The scheduler stack requires the EC2 instance ID and EIP allocation ID that are created by the infrastructure stack. You will also need the ECS cluster name and each service name from those outputs.
+</Warning>
+
+---
+
+## What gets created
+
+The template at `devops/scheduler/template.yml` provisions the following resources:
+
+**Lambda functions**
+- **`StopFunction`** — `{env}-{appName}-ec2-stop`: scales all four ECS services to `desiredCount=0`, disassociates the Elastic IP to avoid idle EIP charges, then stops the EC2 instance. Runtime: Python 3.12, arm64, 120-second timeout.
+- **`StartFunction`** — `{env}-{appName}-ec2-start`: starts the EC2 instance, waits for it to reach the `running` state, reassociates the Elastic IP, then scales all four ECS services to `desiredCount=1`. Runtime: Python 3.12, arm64, 300-second timeout.
+
+**IAM**
+- **Lambda execution role** — `{env}-{appName}-scheduler-lambda-role`: `AWSLambdaBasicExecutionRole` plus inline policy granting `ec2:StopInstances`, `ec2:StartInstances`, `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus`, `ec2:AssociateAddress`, `ec2:DisassociateAddress`, `ec2:DescribeAddresses`, `ecs:UpdateService`, and `ecs:DescribeServices`.
+- **EventBridge execution role** — `{env}-{appName}-eventbridge-scheduler-role`: allows `scheduler.amazonaws.com` to invoke both Lambda functions.
+
+**EventBridge Scheduler**
+- **Scheduler group** — `{env}-{appName}-ec2-schedules`: logical container for both schedule rules.
+- **`StopScheduleWeekdays`** — fires on a configurable cron (default `cron(0 1 ? * MON-SAT *)`) to invoke the stop Lambda Monday through Saturday.
+- **`StartScheduleWeekdays`** — fires on a configurable cron (default `cron(0 9 ? * MON-SAT *)`) to invoke the start Lambda Monday through Saturday. Both schedules use `FlexibleTimeWindow: OFF` (exact time) and retry up to 2 times within a 1-hour window on failure.
+
+**Observability**
+- **CloudWatch log group** for stop Lambda — `/aws/lambda/{env}-{appName}-ec2-stop`, 14-day retention.
+- **CloudWatch log group** for start Lambda — `/aws/lambda/{env}-{appName}-ec2-start`, 14-day retention.
+
+---
+
+## Lambda stop sequence
+
+When the stop schedule fires, `StopFunction` executes the following steps in order:
+
+<Steps>
+  <Step title="Scale ECS services to 0">
+    Calls `ecs:UpdateService` for all four services (`gateway`, `auth`, `application`, `operations`) with `desiredCount=0`. Errors per service are caught and logged as warnings so that a single failing service does not abort the remaining steps.
+  </Step>
+  <Step title="Sleep 10 seconds">
+    Pauses for 10 seconds to allow ECS to process the scale-down and avoid leaving the ECS agent in an inconsistent state.
+  </Step>
+  <Step title="Disassociate the Elastic IP">
+    Calls `ec2:DescribeAddresses` to look up the current `AssociationId` of the EIP. If it is associated, calls `ec2:DisassociateAddress`. This step avoids the AWS charge for an Elastic IP that is allocated but not associated with a running instance.
+  </Step>
+  <Step title="Stop the EC2 instance">
+    Checks the current instance state. If the instance is already `stopped` or `stopping`, the step is skipped. Otherwise calls `ec2:StopInstances`.
+  </Step>
+</Steps>
+
+---
+
+## Lambda start sequence
+
+When the start schedule fires, `StartFunction` executes the following steps in order:
+
+<Steps>
+  <Step title="Check instance state and start">
+    Calls `ec2:DescribeInstances`. If the instance is already `running`, the step is skipped. If it is in a transitional state (e.g. `stopping`), the function waits for it to reach `stopped` using the `instance_stopped` waiter (10-second polling interval, up to 30 attempts = ~5 minutes), then calls `ec2:StartInstances`.
+  </Step>
+  <Step title="Wait for running state">
+    Uses the `instance_running` waiter (10-second polling interval, up to 30 attempts) to block until the instance state is `running`. This ensures the ECS agent is able to come up before subsequent steps proceed.
+  </Step>
+  <Step title="Reassociate the Elastic IP">
+    Calls `ec2:DescribeAddresses` to check whether the EIP is already associated with this instance. If not, calls `ec2:AssociateAddress` with `AllowReassociation=True` to reattach the static public IP.
+  </Step>
+  <Step title="Sleep 30 seconds for ECS agent registration">
+    Pauses for 30 seconds so that the ECS agent on the newly started EC2 instance has time to register with the cluster before task placement is attempted.
+  </Step>
+  <Step title="Scale ECS services to 1">
+    Calls `ecs:UpdateService` for all four services with `desiredCount=1`. Errors per service are caught and logged as warnings.
+  </Step>
+</Steps>
+
+---
+
+## CloudFormation parameters
+
+<Accordion title="All parameters">
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `Environment` | `dev` | Deployment target — `dev`, `qa`, or `prod`. Controls resource naming. |
+| `AppName` | `GSMApplication` | Base name appended to all provisioned resources. |
+| `EC2InstanceId` | *(required)* | ID of the EC2 instance to manage (e.g. `i-0abc123def456`). Retrieve from the infrastructure stack's EC2 resource or the AWS Console. |
+| `EIPAllocationId` | *(required)* | Allocation ID of the Elastic IP (e.g. `eipalloc-0abc1234`). Find it in **EC2 → Elastic IPs** or from the infrastructure stack. |
+| `ECSClusterName` | `dev-cluster` | Name of the ECS cluster. Use the `ECSClusterName` output from the infrastructure stack. |
+| `GatewayServiceName` | `dev-gateway-service` | Name of the gateway ECS service (e.g. `dev-gsmapplication-gateway-service`). |
+| `AuthServiceName` | `dev-auth-service` | Name of the auth ECS service. |
+| `ApplicationServiceName` | `dev-application-service` | Name of the application ECS service. |
+| `OperationsServiceName` | `dev-operations-service` | Name of the operations ECS service. |
+| `SchedulerStartExpression` | `cron(0 9 ? * MON-SAT *)` | EventBridge cron expression (UTC) for the start schedule. Default is 9:00 AM UTC. |
+| `SchedulerStopExpression` | `cron(0 1 ? * MON-SAT *)` | EventBridge cron expression (UTC) for the stop schedule. Default is 1:00 AM UTC. |
+
+</Accordion>
+
+### Deploy manually with AWS CLI
+
+```bash
+aws cloudformation deploy \
+  --template-file devops/scheduler/template.yml \
+  --stack-name dev-gsmapplication-scheduler-stack \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+    Environment=dev \
+    AppName=gsmapplication \
+    EC2InstanceId=i-0abc123def456789 \
+    EIPAllocationId=eipalloc-0abc1234def56789 \
+    ECSClusterName=dev-gsmapplication-cluster \
+    GatewayServiceName=dev-gsmapplication-gateway-service \
+    AuthServiceName=dev-gsmapplication-auth-service \
+    ApplicationServiceName=dev-gsmapplication-application-service \
+    OperationsServiceName=dev-gsmapplication-operations-service \
+    SchedulerStartExpression="cron(0 9 ? * MON-SAT *)" \
+    SchedulerStopExpression="cron(0 1 ? * MON-SAT *)"
+```
+
+---
+
+## Stack outputs
+
+| Output key | Description |
+|------------|-------------|
+| `StopFunctionArn` | ARN of the stop Lambda. Use this to invoke the function manually for testing. |
+| `StartFunctionArn` | ARN of the start Lambda. |
+| `SchedulerGroupName` | Name of the EventBridge Scheduler group (`{env}-{appName}-ec2-schedules`). |
+| `HorarioCOT` | Human-readable summary of the configured schedule in COT (e.g. `Stop Lun-Sab 9pm COT | Start Lun-Sab 7am COT`). |
+
+---
+
+## Adjusting the schedule
+
+Both `SchedulerStartExpression` and `SchedulerStopExpression` accept any valid [EventBridge Scheduler cron expression](https://docs.aws.amazon.com/scheduler/latest/UserGuide/schedule-types.html#cron-based). The schedule timezone is always **UTC**, so you must convert your local business hours to UTC when setting the cron.
+
+**Example — Colombia Time (COT, UTC−5):**
+
+| Local time (COT) | UTC equivalent | Cron expression |
+|------------------|----------------|-----------------|
+| 7:00 AM start | 12:00 UTC | `cron(0 12 ? * MON-SAT *)` |
+| 9:00 PM stop | 02:00 UTC (next day) | `cron(0 2 ? * MON-SAT *)` |
+
+To apply a new schedule, redeploy the stack with updated parameter values:
+
+```bash
+aws cloudformation deploy \
+  --template-file devops/scheduler/template.yml \
+  --stack-name dev-gsmapplication-scheduler-stack \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+  --region us-east-1 \
+  --parameter-overrides \
+    SchedulerStartExpression="cron(0 12 ? * MON-SAT *)" \
+    SchedulerStopExpression="cron(0 2 ? * MON-SAT *)"
+```
+
+<Tip>
+  To temporarily disable automatic start/stop without destroying the stack, set `State: DISABLED` on the schedule resources in the template and redeploy. You can also disable the CI/CD workflow by setting the `WORKFLOW_SCHEDULER_ENABLED` GitHub Actions variable to `false` and triggering a `workflow_dispatch` run — this prevents the workflow from deploying, but does not stop schedules that are already active in AWS. To stop the schedules themselves, either disable them in the EventBridge Scheduler console or redeploy with a no-op cron.
+</Tip>

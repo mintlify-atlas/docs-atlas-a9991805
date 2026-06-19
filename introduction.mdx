@@ -1,0 +1,117 @@
+---
+title: "GSM Infrastructure: AWS IaC for Multi-Service Applications"
+sidebarTitle: "Introduction"
+description: "GSM Infrastructure is a CloudFormation-based platform that deploys ECS-on-EC2 microservices, CloudFront+S3 frontend, cost scheduling, and keyless CI/CD across three environments."
+---
+
+GSM Infrastructure is an AWS CloudFormation infrastructure-as-code platform purpose-built to deploy and operate a multi-service GSM application in the cloud. It eliminates the manual effort of configuring AWS resources by expressing your entire stack — from S3-backed static frontend and ECS microservices, to IAM roles and EventBridge cost-scheduling — as a versioned set of CloudFormation templates. Changes to those templates flow automatically through GitHub Actions workflows that assume short-lived AWS credentials via GitHub OIDC, meaning no static access keys are ever stored or rotated by hand.
+
+<Note>
+  All workflows and templates default to the **`us-east-1`** AWS region. This is set via the `AWS_REGION: us-east-1` environment variable in both the `deploy-infrastructure.yml` and `deploy-scheduler.yml` workflows.
+</Note>
+
+## Three-environment model
+
+The platform manages three isolated environments — **dev**, **qa**, and **prod** — each driven by a dedicated git branch. Pushing a template change to any of these branches triggers the corresponding GitHub Actions workflow, which maps the branch name to the target environment and deploys the correct CloudFormation stack.
+
+| Git Branch  | Environment | Stack name prefix         |
+|-------------|-------------|---------------------------|
+| `develop`   | `dev`       | `dev-{appName}-*-stack`   |
+| `quality`   | `qa`        | `qa-{appName}-*-stack`    |
+| `main`      | `prod`      | `prod-{appName}-*-stack`  |
+
+Both workflows also support a `workflow_dispatch` trigger so you can deploy any environment on demand — for example, to promote a hotfix without going through a branch merge.
+
+## Three CloudFormation stacks
+
+The infrastructure is assembled in three ordered stacks. Each stack builds on the outputs of the one before it, and all three are deployed by the same `InfraExecutorRole` created in the base stack.
+
+### 1. Base stack — `devops/base/template.yml`
+
+The foundation stack. It creates:
+
+- **GitHub OIDC Provider** (`https://token.actions.githubusercontent.com`) — registered once per AWS account so GitHub Actions can exchange a signed JWT for temporary AWS credentials without storing any secret.
+- **`InfraExecutorRole`** — the single IAM role assumed by every subsequent workflow. Its trust policy is scoped to a specific GitHub org, repository, and branch, plus three environment prefixes (`infra-*`, `backend-*`, `frontend-*`).
+- **IAM policies** granting the role rights over CloudFormation, ECS, ECR, EC2, S3, CloudFront, Lambda, EventBridge Scheduler, SSM, KMS, SNS, and Budgets — all scoped to resources prefixed with the target environment.
+
+### 2. Infrastructure stack — `devops/infrastructure/template.yml`
+
+The main application stack. It provisions every runtime resource the application needs:
+
+- S3 frontend bucket + CloudFront distribution with OAC
+- ECS cluster on a single EC2 arm64 instance
+- Four ECS task definitions and services (bridge network mode)
+- ECR repository for container images
+- ECS execution and task IAM roles with SSM/KMS read access
+- Elastic IP for the EC2 instance
+- AWS Budget with SNS email alert
+
+### 3. Scheduler stack — `devops/scheduler/template.yml`
+
+An optional, independently-deployed cost-control layer. It provisions:
+
+- Two Python 3.12 Lambda functions (`ec2-stop` / `ec2-start`) that scale ECS services to 0, disassociate the Elastic IP, and stop/start the EC2 instance in sequence.
+- An EventBridge Scheduler group with two active schedules (weekday start and stop).
+- A dedicated Lambda execution role and EventBridge Scheduler execution role.
+
+## Four ECS microservices
+
+All four services run on the same EC2 instance in Docker bridge networking mode, pulling images from the ECR repository created by the infrastructure stack.
+
+| Service          | Container name    | Host / container port | ECR image tag          |
+|------------------|-------------------|-----------------------|------------------------|
+| Gateway          | `gsmgateway`      | 80                    | `gateway-latest`       |
+| Auth             | `gmsauth`         | 8081                  | `auth-latest`          |
+| Application      | `gsmapplication`  | 8082                  | `application-latest`   |
+| Operations       | `gsmoperations`   | 8083                  | `gsmoperations-latest` |
+
+## GitHub OIDC keyless authentication
+
+Neither workflow stores a long-lived `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY`. Instead, both use the `aws-actions/configure-aws-credentials@v4` action with `role-to-assume` set to the `InfraExecutorRole` ARN. GitHub's OIDC token is automatically exchanged for short-lived STS credentials scoped to the deploying repo, branch, and environment. The OIDC provider and role are created once by the base stack and reused for every subsequent deployment.
+
+```yaml
+- name: Configure AWS credentials
+  uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: ${{ secrets.AWS_INFRA_ROLE_ARN }}
+    aws-region: us-east-1
+```
+
+## Cost scheduling
+
+To avoid paying for idle compute outside business hours, the scheduler stack deploys an automated start/stop cycle driven by **EventBridge Scheduler**. On the configured stop schedule (default `cron(0 1 ? * MON-SAT *)`), a Lambda function scales all four ECS services to `desiredCount=0`, disassociates the Elastic IP to avoid idle EIP charges, then stops the EC2 instance. The start schedule (default `cron(0 9 ? * MON-SAT *)`) reverses the sequence: it starts the instance, waits for it to reach `running`, reassociates the EIP, then scales each ECS service back to `desiredCount=1`.
+
+An **AWS Budget** with a configurable monthly USD limit also sends an SNS email alert when actual spend reaches 100% of the threshold.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card
+    title="Prerequisites"
+    icon="list-check"
+    href="/getting-started/prerequisites"
+  >
+    Review the AWS account setup, IAM, and tooling requirements before deploying.
+  </Card>
+  <Card
+    title="Base Stack Setup"
+    icon="shield-halved"
+    href="/getting-started/base-setup"
+  >
+    Deploy the GitHub OIDC provider and InfraExecutorRole with the base template.
+  </Card>
+  <Card
+    title="Infrastructure Stack"
+    icon="server"
+    href="/deployment/infrastructure-stack"
+  >
+    Deploy the ECS cluster, CloudFront distribution, ECR, and AWS Budget.
+  </Card>
+  <Card
+    title="Scheduler Stack"
+    icon="clock"
+    href="/deployment/scheduler-stack"
+  >
+    Set up automated EC2 start/stop and ECS scaling with EventBridge Scheduler.
+  </Card>
+</CardGroup>

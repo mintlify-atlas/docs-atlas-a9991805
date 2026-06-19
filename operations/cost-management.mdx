@@ -1,0 +1,96 @@
+---
+title: "Cost Management: Budgets, Alerts, and Spend Controls"
+sidebarTitle: "Cost Management"
+description: "Configure AWS Budgets, SNS email alerts, and the automated EC2/ECS scheduler to keep GSM Infrastructure monthly costs within target."
+---
+
+GSM Infrastructure ships with a layered cost-control strategy that combines an AWS Budget ceiling, real-time SNS email alerts, and an automated EC2/ECS start-stop scheduler. Together these controls provide visibility into spend before it exceeds your target and eliminate idle instance-hours during off-hours — all configured declaratively through CloudFormation parameters so each environment can carry its own limit.
+
+## AWS Budget
+
+The `AwsCostBudget` CloudFormation resource provisions a monthly **COST** budget automatically named:
+
+```
+{env}-{appName}-monthly-budget
+```
+
+The budget tracks **actual** (not forecasted) spend and fires a notification when your account crosses **100%** of the `BudgetLimitUSD` parameter value. The default limit is **$30 USD**, but you should override this per environment in your GitHub Actions variables (`BUDGET_LIMIT`).
+
+```yaml
+# infrastructure/template.yml — budget resource (excerpt)
+AwsCostBudget:
+  Type: AWS::Budgets::Budget
+  Properties:
+    Budget:
+      BudgetName: !Sub '${Environment}-${AppName}-monthly-budget'
+      BudgetLimit:
+        Amount: !Ref BudgetLimitUSD
+        Unit: USD
+      BudgetType: COST
+      TimeUnit: MONTHLY
+    NotificationsWithSubscribers:
+      - Notification:
+          NotificationType: ACTUAL
+          ComparisonOperator: GREATER_THAN
+          Threshold: 100
+          ThresholdType: PERCENTAGE
+        Subscribers:
+          - SubscriptionType: SNS
+            Address: !Ref NotificationSNSTopic
+```
+
+<Note>
+AWS Budgets evaluates spend up to three times per day. The alert may not fire the instant you cross the threshold — expect a delay of several hours at most.
+</Note>
+
+## SNS Notification Topic
+
+The infrastructure stack creates an SNS topic named:
+
+```
+{env}-{appName}-notification-alerts
+```
+
+An email subscription is added to the topic at deploy time using the `AlertEmail` CloudFormation parameter (set via the `ALERT_EMAIL` GitHub variable). AWS sends a **subscription confirmation email** to that address immediately after the stack is created or updated.
+
+<Warning>
+The budget notification will not be delivered until the recipient clicks **Confirm subscription** in the confirmation email. Check your inbox (including spam) right after the first deploy.
+</Warning>
+
+The SNS topic also carries an IAM topic policy that allows `events.amazonaws.com` to publish to it, keeping the door open for future EventBridge-to-SNS integrations.
+
+## Automated Scheduler
+
+The start/stop scheduler is the single largest lever for cost reduction. A pair of EventBridge Schedules invoke Lambda functions on a weekday cron to:
+
+1. **Stop** — scale all four ECS services to `desiredCount=0`, disassociate the Elastic IP, then stop the EC2 instance.
+2. **Start** — start the EC2 instance, wait until it is running, reassociate the Elastic IP, then scale ECS services back to `desiredCount=1`.
+
+Stopping the EC2 instance nightly eliminates EC2 instance-hour charges for the entire off-hours window. Disassociating the EIP before shutdown avoids the AWS charge for an **idle** (unassociated) Elastic IP, which applies whenever an EIP is not attached to a running instance.
+
+See [Scheduler](/operations/scheduler) for the full schedule configuration, override procedures, and retry policy details.
+
+## Cost Optimization Tips
+
+<Tip>
+Set `TaskNumberDesired=0` (GitHub variable `TASK_NUMBER_DESIRED`) during initial setup and image build phases. ECS will not attempt to place tasks — and you will not be charged for container runtime — until you are ready to push your first images to ECR.
+</Tip>
+
+<CardGroup cols={2}>
+  <Card title="Use t4g.medium (arm64)" icon="microchip">
+    The default `Ec2InstanceType` is `t4g.medium`. Graviton-based instances offer roughly 20% better price-performance than equivalent x86 instance types. Both Lambda functions in the scheduler stack are also deployed on `arm64` to stay consistent.
+  </Card>
+  <Card title="CloudFront PriceClass_100" icon="globe">
+    The CloudFront distribution uses `PriceClass_100`, restricting edge locations to North America and Europe. This is the lowest-cost price class. If your users are in other regions, evaluate whether the latency trade-off justifies upgrading to `PriceClass_200` or `PriceClass_All`.
+  </Card>
+  <Card title="Short CloudWatch log retention" icon="clock">
+    Backend ECS logs (`/ecs/{env}-{appName}-backend`) are retained for **7 days**. Scheduler Lambda logs are retained for **14 days**. CloudWatch Logs storage is billed per GB — keeping retention windows short prevents unbounded accumulation.
+  </Card>
+  <Card title="Per-environment budget limits" icon="dollar-sign">
+    Set a conservative `BudgetLimitUSD` in development and QA (e.g., **$15**) and a higher value in production. This way, unexpected spend in lower environments triggers an alert before it silently balloons.
+  </Card>
+</CardGroup>
+
+<Tip>
+If you are running a purely development environment that is only used during business hours, combine `TaskNumberDesired=0` with an aggressive stop schedule (e.g., stop at 6 PM COT) to maximize savings. The EC2 instance is the dominant cost driver — every hour it is stopped saves you instance-hour charges.
+</Tip>

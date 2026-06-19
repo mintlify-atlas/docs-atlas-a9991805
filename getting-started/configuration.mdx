@@ -1,0 +1,131 @@
+---
+title: "Configure GitHub Variables and Secrets for GSM Deployments"
+sidebarTitle: "Configuration"
+description: "Set up all required GitHub Actions repository variables, secrets, and environment settings to enable automated GSM Infrastructure deployments."
+---
+
+The GSM Infrastructure GitHub Actions workflows are driven entirely by repository variables and secrets — there are no hardcoded environment values anywhere in the workflow YAML files. Every parameter passed to CloudFormation at deploy time originates from a GitHub variable or secret. This design lets you manage all configuration from a single place in GitHub, override individual values per environment, and rotate secrets without ever editing a workflow file.
+
+## Repository variables
+
+Add these variables under **Settings → Secrets and variables → Actions → Variables** in your GitHub repository. They apply to every branch and environment unless overridden at the environment level.
+
+### Workflow feature flags
+
+<Note>
+  Both workflow files gate their jobs with `if: ${{ vars.WORKFLOW_INFRASTRUCTURE_ENABLED == 'true' }}` (or the scheduler equivalent). The comparison is string-based — the value must be exactly `'true'` (lowercase, no quotes in the UI) to enable the workflow.
+</Note>
+
+| Variable | Value type | Description |
+|----------|-----------|-------------|
+| `WORKFLOW_INFRASTRUCTURE_ENABLED` | `'true'` / `'false'` | Enables the infrastructure deploy job. Set to `'false'` to pause all infrastructure deployments without touching the workflow file. |
+| `WORKFLOW_SCHEDULER_ENABLED` | `'true'` / `'false'` | Enables the scheduler deploy job. Set to `'false'` to pause scheduler deployments independently of the infrastructure workflow. |
+
+### Application identity
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `APP_NAME` | `gsmapplication` | Application name prefix. Appears in every CloudFormation resource name, stack name, ECS cluster name, S3 bucket name, and log group path. |
+
+### Budget and alerting
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `BUDGET_LIMIT` | `30` | Integer USD monthly spend limit. AWS Budgets sends an SNS notification when actual spend exceeds 100% of this value. |
+| `ALERT_EMAIL` | `ops@example.com` | Email address subscribed to the SNS topic that receives budget overage alerts. AWS will send a confirmation email on first deploy — the subscription must be confirmed before alerts fire. |
+
+### CloudFront / EC2 origin authentication
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `CLOUDFRONT_HEADER` | `my-secret-header-value` | Value of the `X-CloudFront-Origin` custom header that CloudFront injects on every request to the EC2 backend origin. The backend validates this header to reject requests that bypass CloudFront. Treat this value like a secret. |
+
+### ECS task sizing
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `TASK_NUMBER_DESIRED` | `1` | Desired running task count for each of the four ECS services (gateway, auth, application, operations). Set to `0` to pause all services without stopping the EC2 instance. Set to `1` or higher to run them. |
+| `TASK_MEMORY` | `512` | Hard memory limit per ECS container, in MB. If a container exceeds this limit, it is killed and restarted. |
+| `TASK_MEMORY_RESERVATION` | `384` | Soft memory reservation per ECS container, in MB. Used by ECS for scheduling decisions; the container may use more than this up to `TASK_MEMORY`. |
+
+### Database connectivity
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `PORT_DB` | `1433` | TCP port for the SQL Server database. Used in the EC2 security group egress rule to allow outbound traffic to the database. |
+| `DB_MASTER_URL_PARAM` | `dev/backend/DB_MASTER_URL` | SSM Parameter Store path for the database connection URL. Injected as a secret into the `auth`, `application`, and `operations` ECS task definitions. |
+| `DB_MASTER_IP` | `10.0.0.5/32` | CIDR block of the database provider. Scopes the security group egress rule to only allow outbound SQL traffic to the known database IP. |
+
+### JWT
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `JWT_SECRET_PARAM` | `dev/backend/JWT_SECRET` | SSM Parameter Store path for the JWT signing secret. Injected as a secret into all four ECS task definitions. |
+
+### Networking
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `VPC_ID` | `vpc-0abc123def456789` | ID of the existing VPC into which the ECS EC2 instance and security groups are deployed. |
+| `VPC_ID_CIDR_BLOCK` | `10.0.0.0/16` | CIDR block of the VPC. Used in the ECS security group to allow inbound HTTP traffic from within the VPC. |
+| `PRIVATE_SUBNET_ID_1` | `subnet-0abc123def456789` | ID of the private subnet for the EC2 instance. The instance has no public IP directly — it uses an Elastic IP and communicates with ECS control plane via NAT or VPC endpoints. |
+
+### EC2
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `KEYPEM_EC2_NAME` | `dev-key-ec2` | Name of the existing EC2 key pair in `us-east-1`. Must match the key pair name exactly as it appears in the AWS Console. |
+| `EC2_INSTANCE_TYPE` | `t4g.medium` | EC2 instance type. The AMI is `amazon-linux-2023/arm64`, so the instance type must be ARM64-compatible (Graviton). Examples: `t4g.small`, `t4g.medium`, `t4g.large`. |
+| `DNS_EC2_ELASTIC_IP` | `52.1.2.3` | DNS name or IP address of an existing Elastic IP to associate with the EC2 instance. Leave empty (`""`) to let CloudFormation allocate a new EIP automatically on each deploy. |
+
+## Scheduler-specific variables
+
+The following variables are used exclusively by `deploy-scheduler.yml` and are not required for the infrastructure stack. They describe the running EC2 and ECS resources that the scheduler Lambda functions will start and stop on a cron schedule.
+
+| Variable | Example value | Description |
+|----------|--------------|-------------|
+| `EC2_INSTANCE_ID` | `i-0abc123def456789a` | ID of the EC2 instance to be started and stopped by the scheduler Lambdas. Retrieve this from the infrastructure stack's EC2 resource after the first deploy. |
+| `EC2_ELASTIC_IP_ID` | `eipalloc-0abc123def` | Allocation ID of the Elastic IP (not the IP address). The stop Lambda disassociates this EIP before shutting down the instance (to avoid idle EIP charges), and the start Lambda re-associates it after the instance is running. |
+| `ECS_CLUSTER` | `dev-gsmapplication-cluster` | Name of the ECS cluster whose services are scaled to 0 (stop) or 1 (start) by the scheduler. |
+| `GATEWAY_SERVICE_NAME` | `dev-gsmapplication-gateway-service` | Name of the ECS gateway service to scale. |
+| `AUTH_SERVICE_NAME` | `dev-gsmapplication-auth-service` | Name of the ECS auth service to scale. |
+| `APPLICATION_SERVICE_NAME` | `dev-gsmapplication-application-service` | Name of the ECS application service to scale. |
+| `OPERATIONS_SERVICE_NAME` | `dev-gsmapplication-operations-service` | Name of the ECS operations service to scale. |
+| `SCHEDULER_START_EXPRESSION` | `cron(0 12 ? * MON-SAT *)` | EventBridge cron expression for the start schedule (UTC). Example: `cron(0 12 ? * MON-SAT *)` starts the instance at 12:00 UTC (7:00 AM COT) Monday–Saturday. |
+| `SCHEDULER_STOP_EXPRESSION` | `cron(0 2 ? * MON-SAT *)` | EventBridge cron expression for the stop schedule (UTC). Example: `cron(0 2 ? * MON-SAT *)` stops the instance at 02:00 UTC (9:00 PM COT) Monday–Saturday. |
+
+## Repository secret
+
+| Secret | Description |
+|--------|-------------|
+| `AWS_INFRA_ROLE_ARN` | ARN of the `InfraExecutorRole` created by the base stack. Both the infrastructure and scheduler workflows use this as `role-to-assume` in the `aws-actions/configure-aws-credentials` step. No long-lived AWS credentials are stored — the OIDC token is exchanged for temporary credentials at runtime. |
+
+Add this under **Settings → Secrets and variables → Actions → Secrets → New repository secret**.
+
+## GitHub environments
+
+Both workflows resolve the deployment environment name dynamically as `infra-{env}` and then reference that GitHub environment for scoped secrets and protection rules. Create all three environments before the first workflow run.
+
+Navigate to **Settings → Environments** and create:
+
+| Environment name | Purpose |
+|-----------------|---------|
+| `infra-dev` | Development deployments |
+| `infra-qa` | Quality / staging deployments |
+| `infra-prod` | Production deployments |
+
+<Tip>
+  Use GitHub environment-level variables to override repository-level variables on a per-environment basis. For example, set a higher `BUDGET_LIMIT` on `infra-prod`, a different `ALERT_EMAIL` for the QA team on `infra-qa`, or a larger `EC2_INSTANCE_TYPE` for production without changing the repository default. Environment variables take precedence over repository variables for jobs that specify that environment.
+</Tip>
+
+## Branch-to-environment mapping
+
+The workflow's `determine-env` job reads the triggering branch name and maps it to the corresponding environment string, which is then used as the GitHub environment name suffix and the CloudFormation `Environment` parameter value.
+
+| Branch | GitHub environment | AWS environment |
+|--------|--------------------|----------------|
+| `develop` | `infra-dev` | `dev` |
+| `quality` | `infra-qa` | `qa` |
+| `main` | `infra-prod` | `prod` |
+
+Any other branch that triggers the workflow (e.g., via a forced push) defaults to `dev`. Both workflows also support `workflow_dispatch` with a manual `environment` input (`dev` / `qa` / `prod`) for on-demand deployments outside the normal branch flow.

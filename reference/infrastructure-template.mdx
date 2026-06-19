@@ -1,0 +1,524 @@
+---
+title: "Infrastructure Template Reference: ECS, CloudFront, ECR, and More"
+sidebarTitle: "Infrastructure Template"
+description: "Complete parameter, resource, and output reference for devops/infrastructure/template.yml — the core GSM application infrastructure CloudFormation stack."
+---
+
+The infrastructure template (`devops/infrastructure/template.yml`) is the main application stack for the GSM platform. It provisions every layer of the application: a CloudFront distribution backed by an S3 bucket for the React SPA frontend, a private EC2 instance running ECS with bridge networking for the four backend microservices, an ECR repository for container images, an Elastic IP for stable public addressing, AWS Budgets with SNS alerting for cost visibility, and all supporting IAM roles, security groups, and log groups. The stack is designed to run on top of an existing VPC and subnet — no network infrastructure is created here.
+
+## Parameters
+
+<ParamField path="Environment" type="String" default="dev">
+  The deployment environment. Controls resource naming prefixes and is injected into containers as the `ENVIRONMENT` variable.
+
+  **Allowed values:** `dev`, `qa`, `prod`
+</ParamField>
+
+<ParamField path="AppName" type="String" default="gsmapplication">
+  The application platform name. Combined with `Environment` to form all resource names.
+</ParamField>
+
+<ParamField path="BudgetLimitUSD" type="Number" default="30">
+  Monthly AWS cost budget limit in USD. When 100% of this threshold is reached an SNS notification is sent to `AlertEmail`.
+</ParamField>
+
+<ParamField path="AlertEmail" type="String" required>
+  Email address that receives budget threshold breach notifications via SNS subscription.
+</ParamField>
+
+<ParamField path="CloudFrontHeader" type="String" required>
+  Secret value injected as the `X-CloudFront-Origin` custom origin header on requests from CloudFront to the EC2 backend. The ECS gateway service can verify this header to reject direct traffic that bypasses CloudFront.
+</ParamField>
+
+<ParamField path="TaskNumberDesired" type="Number" default="0">
+  Desired number of running tasks for each of the four ECS services. Set to `0` on initial deploy; the Scheduler stack manages scaling during business hours.
+</ParamField>
+
+<ParamField path="TaskMemory" type="Number" default="512">
+  Hard memory limit (MiB) per ECS container task. Each task also receives 256 CPU units.
+</ParamField>
+
+<ParamField path="TaskMemoryReservation" type="Number" default="384">
+  Soft memory reservation (MiB) per ECS container task. The container may exceed this up to `TaskMemory`.
+</ParamField>
+
+<ParamField path="DBPortParameterName" type="Number" default="1433">
+  SQL Server port number. Used both as a security group egress rule port and passed to containers via secrets.
+</ParamField>
+
+<ParamField path="DBMasterUrlParameterName" type="String" default="dev/backend/DB_MASTER_URL">
+  SSM Parameter Store path for the database master connection URL. Injected into the Auth, Application, and Operations task definitions as the `DB_MASTER_URL` secret.
+</ParamField>
+
+<ParamField path="SqlServerProviderIp" type="String" default="0.0.0.0/0">
+  CIDR block of the SQL Server provider (e.g. `203.0.113.10/32`). The ECS security group allows outbound TCP to the DB port only to this CIDR.
+</ParamField>
+
+<ParamField path="JWTSecretParameterName" type="String" default="dev/backend/JWT_SECRET">
+  SSM Parameter Store path for the JWT signing secret. Injected into all four task definitions as the `JWT_SECRET` secret.
+</ParamField>
+
+<ParamField path="VpcId" type="AWS::EC2::VPC::Id" required>
+  ID of the existing VPC where the EC2 instance and security group are placed (e.g. the account default VPC).
+</ParamField>
+
+<ParamField path="VpcIdCidrBlock" type="String" default="10.0.0.0/16">
+  CIDR block of the VPC. Used as a security group ingress rule to allow HTTP traffic from within the VPC.
+</ParamField>
+
+<ParamField path="PrivateSubnet1Id" type="AWS::EC2::Subnet::Id" required>
+  ID of the existing private subnet (AZ1) where the ECS EC2 instance is launched.
+</ParamField>
+
+<ParamField path="Ec2PenKeyName" type="String" default="dev-key-ec2">
+  Name of the EC2 key pair used for SSH access to the ECS host instance.
+</ParamField>
+
+<ParamField path="Ec2InstanceType" type="String" default="t4g.medium">
+  EC2 instance type for the ECS host. Must be an ARM64-compatible type to match the Amazon Linux 2023 ECS-optimized AMI resolved at deploy time.
+</ParamField>
+
+<ParamField path="ExistingEIPPublicIp" type="String" default="">
+  Public IP address of an existing Elastic IP to use as the CloudFront custom origin for the backend. Leave empty to use the newly allocated EIP attached to the EC2 instance (`Ec2ElasticIp`). When set, the `NoExistEIP` condition evaluates to `false` and `ECSInstance.PublicDnsName` is not used as the backend origin.
+</ParamField>
+
+## Resources
+
+<AccordionGroup>
+  <Accordion title="S3 + CloudFront">
+
+### FrontendBucket
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::S3::Bucket` |
+| **Name pattern** | `{Environment}-{AppName}-frontend` |
+| **Deletion policy** | `Delete` |
+
+Hosts the compiled React SPA. Versioning is enabled. All public access is blocked — CloudFront is the only authorized reader via an Origin Access Control (OAC). Server-side encryption uses AES-256.
+
+---
+
+### CloudFrontOAC
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::CloudFront::OriginAccessControl` |
+| **Name pattern** | `{Environment}-{AppName}-oac` |
+| **Signing** | `sigv4`, always |
+
+Secures access from CloudFront to the S3 origin so bucket objects never need to be public.
+
+---
+
+### FrontendBucketPolicy
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::S3::BucketPolicy` |
+
+Grants `s3:GetObject`, `s3:ListBucket`, and `s3:GetBucketLocation` to `cloudfront.amazonaws.com` conditioned on the specific CloudFront distribution ARN. All non-HTTPS (`aws:SecureTransport: false`) requests are explicitly denied for all principals.
+
+---
+
+### SpaRouterFunction
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::CloudFront::Function` |
+| **Name pattern** | `{Environment}-{AppName}-spa-router` |
+| **Runtime** | `cloudfront-js-2.0` |
+| **Auto-publish** | `true` |
+
+A CloudFront viewer-request function that rewrites extensionless URL paths (e.g. `/dashboard`, `/login`) to `/index.html` so the React router handles client-side navigation without returning 403/404 from S3.
+
+```javascript
+function handler(event) {
+    var request = event.request;
+    var lastSegment = request.uri.split('/').pop();
+    if (!lastSegment.includes('.')) {
+        request.uri = '/index.html';
+    }
+    return request;
+}
+```
+
+---
+
+### CloudFrontDistribution
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::CloudFront::Distribution` |
+| **Price class** | `PriceClass_100` (US, Canada, Europe) |
+| **Default root object** | `index.html` |
+| **HTTPS** | `redirect-to-https` (default behavior); `https-only` (API behavior) |
+
+Two origins are configured:
+
+| Origin ID | Domain | Notes |
+|---|---|---|
+| `s3-origin` | `FrontendBucket.RegionalDomainName` | Origin path `/admin`; uses OAC |
+| `BackendEC2Origin` | EC2 public DNS or `ExistingEIPPublicIp` | HTTP-only; injects `X-CloudFront-Origin` header |
+
+Two cache behaviors:
+
+| Path | Origin | Caching | Methods |
+|---|---|---|---|
+| `/*` (default) | `s3-origin` | `ForwardedValues.QueryString: false` | `GET, HEAD, OPTIONS` |
+| `/api/*` | `BackendEC2Origin` | TTL 0 (pass-through); forwards `Authorization`, `Content-Type`, `Accept`, `Origin`, `Referer`, all cookies | `DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT` |
+
+  </Accordion>
+
+  <Accordion title="Security Groups">
+
+### EcsSecurityGroup
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::EC2::SecurityGroup` |
+| **Name pattern** | `{Environment}-{AppName}-ecs-security-group` |
+| **VPC** | `VpcId` parameter |
+
+**Ingress rules:**
+
+| Protocol | Ports | Source | Description |
+|---|---|---|---|
+| TCP | 80 | `pl-3b927c52` (CloudFront managed prefix list) | CloudFront → Gateway |
+| TCP | 80 | `VpcIdCidrBlock` | VPC-internal HTTP |
+| TCP | 8081–8083 | `172.17.0.0/16` (Docker bridge) | Inter-container communication |
+
+**Egress rules:**
+
+| Protocol | Ports | Destination | Description |
+|---|---|---|---|
+| TCP | 443 | `0.0.0.0/0` | HTTPS for SSM/ECR |
+| UDP | 53 | `0.0.0.0/0` | DNS resolution |
+| TCP | 8081–8083 | `172.17.0.0/16` | Inter-container communication |
+| TCP | `DBPortParameterName` | `SqlServerProviderIp` | Database access |
+
+  </Accordion>
+
+  <Accordion title="ECR">
+
+### ECRRepository
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECR::Repository` |
+| **Name pattern** | `{Environment}-{AppName}-respository` |
+| **Scan on push** | `true` |
+
+Single private ECR repository that stores all four microservice images using tag conventions: `gateway-latest`, `auth-latest`, `application-latest`, `gsmoperations-latest`.
+
+  </Accordion>
+
+  <Accordion title="ECS Cluster and IAM">
+
+### ECSCluster
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::Cluster` |
+| **Name pattern** | `{Environment}-{AppName}-cluster` |
+
+The ECS cluster that hosts all four microservice tasks on the single EC2 instance using the EC2 launch type with bridge networking.
+
+---
+
+### BackendLogGroup
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Logs::LogGroup` |
+| **Name pattern** | `/ecs/{Environment}-{AppName}-backend` |
+| **Retention** | 7 days |
+| **Deletion policy** | `Delete` |
+
+Shared CloudWatch log group for all four microservice containers. Each container writes to a distinct stream prefix (`gmsgateway`, `gmsauth`, `gsmapplication`, `gsmoperations`).
+
+---
+
+### ECSExecutionRole
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Role` |
+| **Name pattern** | `{Environment}-{AppName}-ecs-role` |
+| **Managed policy** | `AmazonECSTaskExecutionRolePolicy` |
+
+The ECS task execution role. Trusted by `ecs-tasks.amazonaws.com`. Also receives the `ECSRoleSSMPolicy` managed policy for SSM Parameter Store and KMS access.
+
+---
+
+### ECSTaskRole
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Role` |
+| **Name pattern** | `{Environment}-{AppName}-ecs-task-role` |
+
+The ECS task role (application identity). Trusted by `ecs-tasks.amazonaws.com`. Also receives the `ECSRoleSSMPolicy` managed policy.
+
+---
+
+### ECSRoleSSMPolicy
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::ManagedPolicy` |
+| **Name pattern** | `{Environment}-{AppName}-ecs-ssm-read` |
+| **Attached to** | `ECSExecutionRole`, `ECSTaskRole` |
+
+Grants `ssm:GetParameter` and `ssm:GetParameters` on `/{Environment}/*` parameters, and `kms:Decrypt` on account KMS keys so tasks can resolve secrets at startup.
+
+  </Accordion>
+
+  <Accordion title="ECS Task Definitions">
+
+All four task definitions share the following configuration:
+
+| Field | Value |
+|---|---|
+| **Network mode** | `bridge` |
+| **Launch type** | `EC2` |
+| **CPU** | 256 units per container |
+| **Memory** | `TaskMemory` (hard) / `TaskMemoryReservation` (soft) |
+| **Log driver** | `awslogs` → `BackendLogGroup` |
+| **Health check** | `wget -qO- http://localhost:{port}/[api/]health` — interval 30s, timeout 10s, retries 3, start period 120s |
+
+---
+
+### GatewayTaskDefinition
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::TaskDefinition` |
+| **Family** | `{Environment}-{AppName}-gateway-task` |
+| **Container** | `gsmgateway` |
+| **Image tag** | `gateway-latest` |
+| **Port** | `80:80` (host:container) |
+| **Secrets** | `JWT_SECRET` from SSM |
+| **Environment vars** | `ORIGINS` (CloudFront domain), `ENVIRONMENT` |
+| **Health check path** | `/api/health` |
+
+---
+
+### AuthTaskDefinition
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::TaskDefinition` |
+| **Family** | `{Environment}-{AppName}-auth-task` |
+| **Container** | `gmsauth` |
+| **Image tag** | `auth-latest` |
+| **Port** | `8081:8081` |
+| **Secrets** | `JWT_SECRET`, `DB_MASTER_URL` from SSM |
+| **Environment vars** | `ENVIRONMENT` |
+| **Health check path** | `/health` |
+
+---
+
+### ApplicationTaskDefinition
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::TaskDefinition` |
+| **Family** | `{Environment}-{AppName}-application-task` |
+| **Container** | `gsmapplication` |
+| **Image tag** | `application-latest` |
+| **Port** | `8082:8082` |
+| **Secrets** | `JWT_SECRET`, `DB_MASTER_URL` from SSM |
+| **Environment vars** | `ENVIRONMENT` |
+| **Health check path** | `/health` |
+
+---
+
+### OperationsTaskDefinition
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::TaskDefinition` |
+| **Family** | `{Environment}-{AppName}-operations-task` |
+| **Container** | `gsmoperations` |
+| **Image tag** | `gsmoperations-latest` |
+| **Port** | `8083:8083` |
+| **Secrets** | `JWT_SECRET`, `DB_MASTER_URL` from SSM |
+| **Environment vars** | `ENVIRONMENT` |
+| **Health check path** | `/health` |
+
+  </Accordion>
+
+  <Accordion title="ECS Services">
+
+All four services share the following deployment configuration:
+
+| Field | Value |
+|---|---|
+| **Launch type** | `EC2` |
+| **Desired count** | `TaskNumberDesired` parameter |
+| **Max percent** | 100 |
+| **Min healthy percent** | 0 |
+| **Circuit breaker** | Enabled with automatic rollback |
+| **Health check grace period** | 60 seconds |
+| **Execute command** | Disabled |
+
+---
+
+### GatewayService
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::Service` |
+| **Name pattern** | `{Environment}-{AppName}-gateway-service` |
+| **Task definition** | `GatewayTaskDefinition` |
+
+---
+
+### AuthService
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::Service` |
+| **Name pattern** | `{Environment}-{AppName}-auth-service` |
+| **Task definition** | `AuthTaskDefinition` |
+
+---
+
+### ApplicationService
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::Service` |
+| **Name pattern** | `{Environment}-{AppName}-application-service` |
+| **Task definition** | `ApplicationTaskDefinition` |
+
+---
+
+### OperationsService
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::ECS::Service` |
+| **Name pattern** | `{Environment}-{AppName}-operations-service` |
+| **Task definition** | `OperationsTaskDefinition` |
+
+  </Accordion>
+
+  <Accordion title="EC2">
+
+### ECSInstanceRole
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::Role` |
+| **Name pattern** | `{Environment}-{AppName}-instance-ecs-role` |
+| **Managed policies** | `AmazonEC2ContainerServiceforEC2Role`, `AmazonSSMManagedInstanceCore` |
+
+Trusted by `ec2.amazonaws.com`. Includes an inline policy granting `ssm:GetParameter*` and `kms:Decrypt` scoped to `/{Environment}/*` parameters so the ECS agent can pull secrets during task startup.
+
+---
+
+### EC2InstanceProfile
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::IAM::InstanceProfile` |
+| **Name pattern** | `{Environment}-{AppName}-instance-ecs-profile` |
+| **Role** | `ECSInstanceRole` |
+
+Instance profile that attaches `ECSInstanceRole` to the EC2 instance.
+
+---
+
+### ECSInstance
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::EC2::Instance` |
+| **Name tag** | `{Environment}-{AppName}-ec2-instance` |
+| **Architecture** | arm64 |
+| **AMI** | Resolved at deploy time from SSM: `/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id` |
+| **Instance type** | `Ec2InstanceType` parameter (default `t4g.medium`) |
+| **Subnet** | `PrivateSubnet1Id` parameter |
+| **Key pair** | `Ec2PenKeyName` parameter |
+| **Security group** | `EcsSecurityGroup` |
+
+User data configures the ECS agent at launch:
+
+```bash
+#!/bin/bash
+mkdir -p /etc/ecs
+echo ECS_CLUSTER=${Environment}-${AppName}-cluster > /etc/ecs/ecs.config
+
+systemctl enable docker
+systemctl start docker
+systemctl enable ecs
+systemctl daemon-reload
+systemctl start ecs
+```
+
+  </Accordion>
+
+  <Accordion title="Elastic IP">
+
+### Ec2ElasticIp
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::EC2::EIP` |
+| **Name tag** | `{Environment}-{AppName}-ec2-eip` |
+| **Domain** | `vpc` |
+| **Attached to** | `ECSInstance` |
+
+Provides a stable public IP address for the EC2 ECS host. CloudFront uses this IP as the backend custom origin endpoint. The Scheduler stack manages disassociation (before shutdown) and reassociation (after startup) to avoid charges for idle Elastic IPs.
+
+  </Accordion>
+
+  <Accordion title="Budget + SNS">
+
+### NotificationSNSTopic
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::SNS::Topic` |
+| **Name pattern** | `{Environment}-{AppName}-notification-alerts` |
+| **Subscription** | Email to `AlertEmail` parameter |
+
+SNS topic that delivers budget breach notifications. Also allows `events.amazonaws.com` to publish via the `NotificationSNSTopicPolicy`.
+
+---
+
+### NotificationSNSTopicPolicy
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::SNS::TopicPolicy` |
+
+Grants `sns:Publish` to `events.amazonaws.com` on the notification topic so EventBridge can forward cost alert events.
+
+---
+
+### AwsCostBudget
+
+| Field | Value |
+|---|---|
+| **Type** | `AWS::Budgets::Budget` |
+| **Name pattern** | `{Environment}-{AppName}-monthly-budget` |
+| **Budget type** | `COST` |
+| **Time unit** | `MONTHLY` |
+| **Limit** | `BudgetLimitUSD` USD |
+
+Sends an SNS notification to `NotificationSNSTopic` when **actual** monthly spend exceeds **100%** of the configured limit.
+
+  </Accordion>
+</AccordionGroup>
+
+## Outputs
+
+| Output | Description |
+|---|---|
+| `FrontendBucketName` | Name of the S3 bucket hosting the compiled SPA (e.g. `dev-gsmapplication-frontend`). |
+| `CloudFrontDomain` | CloudFront distribution domain name (e.g. `d1234abcd.cloudfront.net`). Use this as the application's public URL. |
+| `ECSClusterName` | Name of the ECS cluster (e.g. `dev-gsmapplication-cluster`). Required as input for the Scheduler stack. |
+| `BudgetName` | Name of the AWS Budget resource (e.g. `dev--gsmapplication-monthly-budget`). |
